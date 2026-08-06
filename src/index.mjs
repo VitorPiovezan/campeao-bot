@@ -57,6 +57,7 @@ function getState(guildId) {
       attention: new Map(),
       duckTimer: null,
       seqCounter: 0,
+      recentEnqueued: new Map(),
     });
   }
   return guilds.get(guildId);
@@ -305,6 +306,20 @@ async function enqueue(gs, rawQuery, by) {
   }
   track.by = by;
   track.seq = seq;
+  const recentTs = gs.recentEnqueued.get(track.url);
+  const isDupe =
+    gs.current?.url === track.url ||
+    gs.queue.some((t) => t.url === track.url) ||
+    (recentTs && Date.now() - recentTs < 60000);
+  if (isDupe) {
+    console.log(`[fila] duplicata ignorada: ${track.title}`);
+    return;
+  }
+  gs.recentEnqueued.set(track.url, Date.now());
+  if (gs.recentEnqueued.size > 50) {
+    const oldest = gs.recentEnqueued.keys().next().value;
+    gs.recentEnqueued.delete(oldest);
+  }
   const idx = gs.queue.findIndex((t) => t.seq > seq);
   if (idx === -1) gs.queue.push(track);
   else gs.queue.splice(idx, 0, track);
