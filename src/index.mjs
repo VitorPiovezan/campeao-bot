@@ -56,6 +56,7 @@ function getState(guildId) {
       listening: new Set(),
       attention: new Map(),
       duckTimer: null,
+      seqCounter: 0,
     });
   }
   return guilds.get(guildId);
@@ -130,19 +131,18 @@ async function deezerLookup(query) {
   }
 }
 
-async function runYtdlp(args, target) {
+async function runYtdlp(args) {
   try {
-    const { stdout } = await execFileP(
-      "yt-dlp",
-      [...YTDLP_BASE, ...args, "-f", "bestaudio/best", "--print", "%(title)s\t%(webpage_url)s\t%(channel)s\t%(duration)s", target],
-      { timeout: 60000 },
-    );
+    const { stdout } = await execFileP("yt-dlp", [...YTDLP_BASE, ...args], { timeout: 60000 });
     return stdout;
   } catch (e) {
     if (e.stdout?.trim()) return e.stdout;
     throw e;
   }
 }
+
+const PRINT_FULL = ["--print", "%(title)s\t%(webpage_url)s\t%(channel)s\t%(duration)s"];
+const PRINT_FLAT = ["--print", "%(title)s\t%(url)s\t%(channel)s\t%(duration)s"];
 
 function parseCandidates(stdout) {
   return stdout
@@ -186,47 +186,60 @@ function scoreCandidate(c, want) {
   return score;
 }
 
+const shortErr = (e) => (e.stderr || e.message || "").toString().replace(/\s+/g, " ").slice(0, 250);
+
 async function resolveTrack(query, source = "auto") {
-  const isUrl = /^https?:\/\//.test(query);
-  const tvArgs = ["--extractor-args", "youtube:player_client=tv"];
-  const yt = (q) => ({ label: "youtube", args: ["-i", "--no-playlist"], target: `ytsearch5:${q}` });
-  const yttv = (q) => ({ label: "youtube-tv", args: ["-i", "--no-playlist", ...tvArgs], target: `ytsearch5:${q}`, extra: tvArgs });
-  const sc = (q) => ({ label: "soundcloud", args: ["-i"], target: `scsearch5:${q}` });
-  let attempts;
+  if (/^https?:\/\//.test(query)) {
+    try {
+      const c = parseCandidates(await runYtdlp(["--no-playlist", "-f", "bestaudio/best", ...PRINT_FULL, query]))[0];
+      return c ? { title: c.title, url: c.url } : null;
+    } catch (e) {
+      console.log(`[busca] url falhou: ${shortErr(e)}`);
+      return null;
+    }
+  }
   let forcedTitle = null;
   let want = { query, duration: null };
-  if (isUrl) {
-    attempts = [{ label: "url", args: ["--no-playlist"], target: query }];
-  } else if (source === "youtube") {
-    attempts = [yt(query), yttv(query)];
-  } else if (source === "soundcloud") {
-    attempts = [sc(query)];
-  } else {
+  if (source !== "youtube" && source !== "soundcloud") {
     const dz = await deezerLookup(query);
-    const refined = dz ? `${dz.artist} ${dz.title}` : query;
     if (dz) {
       forcedTitle = dz.label;
-      want = { query: refined, duration: dz.duration };
-      console.log(`[busca] deezer refinou: "${query}" -> "${refined}" (${dz.duration}s)`);
+      want = { query: `${dz.artist} ${dz.title}`, duration: dz.duration };
+      console.log(`[busca] deezer refinou: "${query}" -> "${want.query}" (${dz.duration}s)`);
     }
-    attempts = [yt(want.query), yttv(want.query), sc(want.query)];
   }
-  for (const attempt of attempts) {
+  if (source !== "soundcloud") {
     try {
-      const stdout = await runYtdlp(attempt.args, attempt.target);
-      const candidates = parseCandidates(stdout)
+      const flat = parseCandidates(await runYtdlp(["-i", "--flat-playlist", ...PRINT_FLAT, `ytsearch6:${want.query}`]))
+        .map((c) => ({ ...c, score: scoreCandidate(c, want) }))
+        .sort((a, b) => b.score - a.score);
+      console.log(`[busca] youtube: ${flat.map((c) => `${c.score.toFixed(1)} ${c.title?.slice(0, 45)}`).join(" | ")}`);
+      for (const cand of flat.slice(0, 3)) {
+        try {
+          const ok = parseCandidates(await runYtdlp(["--no-playlist", "-f", "bestaudio/best", ...PRINT_FULL, cand.url]))[0];
+          if (ok) return { title: forcedTitle ?? ok.title, url: ok.url };
+        } catch (e) {
+          const err = shortErr(e);
+          console.log(`[busca] validação falhou: ${err}`);
+          if (/sign in|not a bot/i.test(err)) break;
+        }
+      }
+    } catch (e) {
+      console.log(`[busca] youtube falhou: ${shortErr(e)}`);
+    }
+  }
+  if (source !== "youtube") {
+    try {
+      const candidates = parseCandidates(await runYtdlp(["-i", "-f", "bestaudio/best", ...PRINT_FULL, `scsearch5:${want.query}`]))
         .map((c) => ({ ...c, score: scoreCandidate(c, want) }))
         .sort((a, b) => b.score - a.score);
       const best = candidates[0];
       if (best) {
-        console.log(
-          `[busca] ${attempt.label}: ${candidates.map((c) => `${c.score.toFixed(1)} ${c.title?.slice(0, 50)}`).join(" | ")}`,
-        );
-        return { title: forcedTitle ?? best.title, url: best.url, extra: attempt.extra ?? [] };
+        console.log(`[busca] soundcloud: ${candidates.map((c) => `${c.score.toFixed(1)} ${c.title?.slice(0, 45)}`).join(" | ")}`);
+        return { title: forcedTitle ?? best.title, url: best.url };
       }
     } catch (e) {
-      const err = (e.stderr || e.message || "").toString().replace(/\s+/g, " ").slice(0, 250);
-      console.log(`[busca] ${attempt.label} falhou: ${err}`);
+      console.log(`[busca] soundcloud falhou: ${shortErr(e)}`);
     }
   }
   return null;
@@ -240,7 +253,7 @@ function playNext(gs) {
   gs.currentResource = null;
   if (!next) return;
   console.log(`[player] tocando: ${next.title}`);
-  const ytdlp = spawn("yt-dlp", [...YTDLP_BASE, ...(next.extra ?? []), "-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", next.url]);
+  const ytdlp = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", next.url]);
   const ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"]);
   ytdlp.stderr.on("data", (d) => console.log(`[yt-dlp] ${d.toString().trim().slice(0, 200)}`));
   ytdlp.stdout.pipe(ff.stdin);
@@ -251,7 +264,7 @@ function playNext(gs) {
   const resource = createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
   gs.currentResource = resource;
   gs.player.play(resource);
-  gs.textChannel?.send(`▶️ Tocando agora: **${next.title}** (pedido por ${next.by})`).catch(() => {});
+  gs.textChannel?.send(`▶️ Tocando agora: **${next.title}** (pedido por ${next.by}) — <${next.url}>`).catch(() => {});
 }
 
 function playBeep(gs) {
@@ -284,17 +297,21 @@ function unduck(gs) {
 
 async function enqueue(gs, rawQuery, by) {
   const { query, source } = parseSource(rawQuery);
+  const seq = ++gs.seqCounter;
   const track = await resolveTrack(query, source);
   if (!track) {
     gs.textChannel?.send(`😔 Não achei nada pra "${query}"`).catch(() => {});
     return;
   }
   track.by = by;
-  gs.queue.push(track);
+  track.seq = seq;
+  const idx = gs.queue.findIndex((t) => t.seq > seq);
+  if (idx === -1) gs.queue.push(track);
+  else gs.queue.splice(idx, 0, track);
   if (gs.player.state.status === AudioPlayerStatus.Idle || !gs.current) {
     playNext(gs);
   } else {
-    gs.textChannel?.send(`➕ Na fila (#${gs.queue.length}): **${track.title}**`).catch(() => {});
+    gs.textChannel?.send(`➕ Na fila (#${gs.queue.indexOf(track) + 1}): **${track.title}**`).catch(() => {});
   }
 }
 
