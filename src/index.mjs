@@ -99,6 +99,32 @@ function killProcs(gs) {
   gs.procs = [];
 }
 
+function parseSource(raw) {
+  const m = raw.match(/\s+(?:no|na|do|da|em|pelo|pela)\s+(youtube|you tube|iutubi|soundcloud|sound cloud|saundclaud|deezer|dizer|diser|spotify|spotifai)$/);
+  if (!m) return { query: raw, source: "auto" };
+  const word = m[1].replace(/\s/g, "");
+  const source = word.startsWith("sound") || word.startsWith("saund")
+    ? "soundcloud"
+    : word.startsWith("you") || word.startsWith("iutu")
+      ? "youtube"
+      : "deezer";
+  return { query: raw.slice(0, m.index).trim(), source };
+}
+
+async function deezerLookup(query) {
+  try {
+    const res = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=1`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    const track = (await res.json()).data?.[0];
+    if (!track?.title) return null;
+    return { artist: track.artist?.name ?? "", title: track.title, label: `${track.artist?.name} - ${track.title}` };
+  } catch (e) {
+    console.log("[deezer] erro:", e.message);
+    return null;
+  }
+}
+
 async function runYtdlp(args, target) {
   try {
     const { stdout } = await execFileP(
@@ -113,16 +139,29 @@ async function runYtdlp(args, target) {
   }
 }
 
-async function resolveTrack(query) {
+async function resolveTrack(query, source = "auto") {
   const isUrl = /^https?:\/\//.test(query);
   const tvArgs = ["--extractor-args", "youtube:player_client=tv"];
-  const attempts = isUrl
-    ? [{ label: "url", args: ["--no-playlist"], target: query }]
-    : [
-        { label: "youtube", args: ["--no-playlist"], target: `ytsearch1:${query}` },
-        { label: "youtube-tv", args: ["--no-playlist", ...tvArgs], target: `ytsearch1:${query}`, extra: tvArgs },
-        { label: "soundcloud", args: ["-i"], target: `scsearch5:${query}` },
-      ];
+  const yt = (q) => ({ label: "youtube", args: ["--no-playlist"], target: `ytsearch1:${q}` });
+  const yttv = (q) => ({ label: "youtube-tv", args: ["--no-playlist", ...tvArgs], target: `ytsearch1:${q}`, extra: tvArgs });
+  const sc = (q) => ({ label: "soundcloud", args: ["-i"], target: `scsearch5:${q}` });
+  let attempts;
+  let forcedTitle = null;
+  if (isUrl) {
+    attempts = [{ label: "url", args: ["--no-playlist"], target: query }];
+  } else if (source === "youtube") {
+    attempts = [yt(query), yttv(query)];
+  } else if (source === "soundcloud") {
+    attempts = [sc(query)];
+  } else {
+    const dz = await deezerLookup(query);
+    const refined = dz ? `${dz.artist} ${dz.title}` : query;
+    if (dz) {
+      forcedTitle = dz.label;
+      console.log(`[busca] deezer refinou: "${query}" -> "${refined}"`);
+    }
+    attempts = [yt(refined), yttv(refined), sc(refined)];
+  }
   for (const attempt of attempts) {
     try {
       const stdout = await runYtdlp(attempt.args, attempt.target);
@@ -130,7 +169,7 @@ async function resolveTrack(query) {
       const [title, url] = (line ?? "").split("\t");
       if (url) {
         console.log(`[busca] ${attempt.label} achou: ${title}`);
-        return { title, url, extra: attempt.extra ?? [] };
+        return { title: forcedTitle ?? title, url, extra: attempt.extra ?? [] };
       }
     } catch (e) {
       const err = (e.stderr || e.message || "").toString().replace(/\s+/g, " ").slice(0, 250);
@@ -190,8 +229,9 @@ function unduck(gs) {
   gs.currentResource?.volume?.setVolume(1);
 }
 
-async function enqueue(gs, query, by) {
-  const track = await resolveTrack(query);
+async function enqueue(gs, rawQuery, by) {
+  const { query, source } = parseSource(rawQuery);
+  const track = await resolveTrack(query, source);
   if (!track) {
     gs.textChannel?.send(`😔 Não achei nada pra "${query}"`).catch(() => {});
     return;
@@ -499,6 +539,7 @@ client.on(Events.MessageCreate, async (m) => {
       [
         '**Por voz** (comigo no canal): "CAMPEÃO, TOCA <música>" — também: pula, pausa, continua, para, sai',
         'Com música tocando, fala só "CAMPEÃO" que eu abaixo o som e te escuto por 2s',
+        'Fonte específica: "CAMPEÃO, TOCA <música> **no youtube**" (ou no soundcloud). Sem falar, o Deezer acha a faixa certa e eu busco o áudio',
         "**Por texto**: `!entra` `!play <música>` `!pula` `!pausa` `!continua` `!para` `!fila` `!sai`",
       ].join("\n"),
     ).catch(() => {});
