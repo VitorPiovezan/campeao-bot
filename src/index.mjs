@@ -27,11 +27,11 @@ const guilds = new Map();
 function ensureBeep() {
   if (existsSync(BEEP_FILE)) return;
   execFileSync("ffmpeg", [
-    "-f", "lavfi",
-    "-i", "sine=frequency=740:duration=0.13,sine=frequency=988:duration=0.13",
-    "-filter_complex", "concat=n=2:v=0:a=1,volume=0.35",
-    "-f", "s16le", "-ar", "48000", "-ac", "2",
-    "-y", BEEP_FILE,
+    "-f", "lavfi", "-i", "sine=frequency=740:duration=0.13",
+    "-f", "lavfi", "-i", "sine=frequency=988:duration=0.13",
+    "-filter_complex",
+    "[0:a][1:a]concat=n=2:v=0:a=1,volume=0.35,aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo",
+    "-f", "s16le", "-y", BEEP_FILE,
   ], { stdio: "ignore" });
 }
 
@@ -373,5 +373,12 @@ client.once(Events.ClientReady, () => {
   console.log(`Campeão online como ${client.user.tag}`);
 });
 
-ensureBeep();
-client.login(TOKEN);
+try {
+  ensureBeep();
+} catch (e) {
+  console.error("Falha ao gerar bip (seguindo sem):", e.message);
+}
+client.login(TOKEN).catch((e) => {
+  console.error("Falha no login do Discord:", e.message);
+  process.exit(1);
+});
