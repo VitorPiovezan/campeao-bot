@@ -16,6 +16,11 @@ import prism from "prism-media";
 
 const execFileP = promisify(execFile);
 const TOKEN = process.env.DISCORD_TOKEN;
+const POT_URL = process.env.POT_PROVIDER_URL;
+const YTDLP_BASE = [
+  "--js-runtimes", "node",
+  ...(POT_URL ? ["--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_URL}`] : []),
+];
 const STT_URL = "http://127.0.0.1:5005/";
 const WAKE_WORDS = ["campeao", "campiao", "capiao", "campeaum", "campeon"];
 const ATTENTION_MS = 2500;
@@ -75,7 +80,7 @@ async function runYtdlp(args, target) {
   try {
     const { stdout } = await execFileP(
       "yt-dlp",
-      ["--js-runtimes", "node", ...args, "-f", "bestaudio/best", "--print", "%(title)s\t%(webpage_url)s", target],
+      [...YTDLP_BASE, ...args, "-f", "bestaudio/best", "--print", "%(title)s\t%(webpage_url)s", target],
       { timeout: 45000 },
     );
     return stdout;
@@ -120,7 +125,7 @@ function playNext(gs) {
   gs.currentResource = null;
   if (!next) return;
   console.log(`[player] tocando: ${next.title}`);
-  const ytdlp = spawn("yt-dlp", ["--js-runtimes", "node", ...(next.extra ?? []), "-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", next.url]);
+  const ytdlp = spawn("yt-dlp", [...YTDLP_BASE, ...(next.extra ?? []), "-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", next.url]);
   const ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"]);
   ytdlp.stderr.on("data", (d) => console.log(`[yt-dlp] ${d.toString().trim().slice(0, 200)}`));
   ytdlp.stdout.pipe(ff.stdin);
@@ -204,7 +209,14 @@ function to16kMono(pcm) {
   return out;
 }
 
+let sttPending = 0;
+
 async function transcribe(pcm) {
+  if (sttPending >= 2) {
+    console.log("[stt] ocupado, descartando fala");
+    return null;
+  }
+  sttPending++;
   try {
     const res = await fetch(STT_URL, {
       method: "POST",
@@ -220,6 +232,8 @@ async function transcribe(pcm) {
   } catch (e) {
     console.log("[stt] erro:", e.message);
     return null;
+  } finally {
+    sttPending--;
   }
 }
 
@@ -247,7 +261,13 @@ function captureUtterance(gs, userId) {
   decoder.on("end", async () => {
     gs.listening.delete(userId);
     const pcm = Buffer.concat(chunks);
-    if (pcm.length < 48000 * 2 * 2 * 0.6) return;
+    const secs = pcm.length / (48000 * 2 * 2);
+    if (secs < 0.6) return;
+    if (secs > 8) {
+      console.log(`[voz] descartando fala de ${secs.toFixed(1)}s (longa demais, provável vazamento de música)`);
+      return;
+    }
+    if ((gs.attention.get(userId) ?? 0) > startedAt) playBeep(gs);
     const text = await transcribe(to16kMono(pcm));
     console.log(`[stt] ${user?.username ?? userId}: "${text}"`);
     if (text) handleVoice(gs, userId, text, startedAt);

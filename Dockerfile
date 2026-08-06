@@ -2,7 +2,7 @@ FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg python3 python3-venv build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir faster-whisper yt-dlp
+RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir faster-whisper yt-dlp bgutil-ytdlp-pot-provider
 ENV PATH="/opt/venv/bin:$PATH"
 WORKDIR /app
 COPY package.json ./
