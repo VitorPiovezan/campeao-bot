@@ -61,6 +61,19 @@ function getState(guildId) {
   return guilds.get(guildId);
 }
 
+function editDistance(a, b) {
+  const dp = Array.from({ length: a.length + 1 }, (_, i) => [i, ...new Array(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+const isWakeWord = (w) => WAKE_WORDS.includes(w) || (w.length >= 6 && editDistance(w, "campeao") <= 2);
+
 const norm = (s) =>
   s
     .toLowerCase()
@@ -320,7 +333,7 @@ function handleVoice(gs, userId, raw, startedAt) {
   const text = norm(raw);
   if (!text) return;
   const words = text.split(" ");
-  const wakeIdx = words.findIndex((w) => WAKE_WORDS.includes(w));
+  const wakeIdx = words.findIndex(isWakeWord);
   const attentive = (gs.attention.get(userId) ?? 0) > startedAt;
   let rest;
   if (wakeIdx !== -1 && wakeIdx <= 4) {
