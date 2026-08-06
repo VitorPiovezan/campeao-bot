@@ -17,6 +17,7 @@ import prism from "prism-media";
 const execFileP = promisify(execFile);
 const TOKEN = process.env.DISCORD_TOKEN;
 const POT_URL = process.env.POT_PROVIDER_URL;
+const GROQ_KEY = process.env.GROQ_API_KEY;
 const YTDLP_BASE = [
   "--js-runtimes", "node",
   ...(POT_URL ? ["--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_URL}`] : []),
@@ -211,13 +212,51 @@ function to16kMono(pcm) {
 
 let sttPending = 0;
 
-async function transcribe(pcm) {
-  if (sttPending >= 2) {
+function wavFrom(pcm) {
+  const h = Buffer.alloc(44);
+  h.write("RIFF", 0);
+  h.writeUInt32LE(36 + pcm.length, 4);
+  h.write("WAVE", 8);
+  h.write("fmt ", 12);
+  h.writeUInt32LE(16, 16);
+  h.writeUInt16LE(1, 20);
+  h.writeUInt16LE(1, 22);
+  h.writeUInt32LE(16000, 24);
+  h.writeUInt32LE(32000, 28);
+  h.writeUInt16LE(2, 32);
+  h.writeUInt16LE(16, 34);
+  h.write("data", 36);
+  h.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([h, pcm]);
+}
+
+async function groqTranscribe(pcm) {
+  const fd = new FormData();
+  fd.append("file", new Blob([wavFrom(pcm)], { type: "audio/wav" }), "audio.wav");
+  fd.append("model", "whisper-large-v3-turbo");
+  fd.append("language", "pt");
+  const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${GROQ_KEY}` },
+    body: fd,
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) {
+    console.log("[stt] groq resposta", res.status, (await res.text()).slice(0, 200));
+    return null;
+  }
+  return ((await res.json()).text ?? "").trim() || null;
+}
+
+async function transcribe(pcm, priority = false) {
+  const limit = GROQ_KEY ? 4 : 1;
+  if (!priority && sttPending >= limit) {
     console.log("[stt] ocupado, descartando fala");
     return null;
   }
   sttPending++;
   try {
+    if (GROQ_KEY) return await groqTranscribe(pcm);
     const res = await fetch(STT_URL, {
       method: "POST",
       body: pcm,
@@ -263,12 +302,13 @@ function captureUtterance(gs, userId) {
     const pcm = Buffer.concat(chunks);
     const secs = pcm.length / (48000 * 2 * 2);
     if (secs < 0.6) return;
-    if (secs > 8) {
+    if (secs > 6) {
       console.log(`[voz] descartando fala de ${secs.toFixed(1)}s (longa demais, provável vazamento de música)`);
       return;
     }
-    if ((gs.attention.get(userId) ?? 0) > startedAt) playBeep(gs);
-    const text = await transcribe(to16kMono(pcm));
+    const attentive = (gs.attention.get(userId) ?? 0) > startedAt;
+    if (attentive) playBeep(gs);
+    const text = await transcribe(to16kMono(pcm), attentive);
     console.log(`[stt] ${user?.username ?? userId}: "${text}"`);
     if (text) handleVoice(gs, userId, text, startedAt);
   });
@@ -320,11 +360,13 @@ function handleVoice(gs, userId, raw, startedAt) {
   }
   if (/^pausa/.test(rest)) {
     gs.player.pause();
+    gs.textChannel?.send(`⏸️ ${mention} pausou a música`).catch(() => {});
     return;
   }
   if (/^(continua|volta|despausa|resume)/.test(rest)) {
     unduck(gs);
     gs.player.unpause();
+    gs.textChannel?.send(`▶️ ${mention} despausou a música`).catch(() => {});
     return;
   }
   if (/^(para|pare|stop|chega|cala)/.test(rest)) {
@@ -336,6 +378,9 @@ function handleVoice(gs, userId, raw, startedAt) {
     gs.textChannel?.send(`👋 Falou, ${mention}!`).catch(() => {});
     leave(gs);
     return;
+  }
+  if (wakeIdx !== -1) {
+    gs.textChannel?.send(`🤔 ${mention}, entendi "${rest}" mas não conheço esse comando`).catch(() => {});
   }
   console.log(`[wake] não entendi: "${rest}"`);
 }

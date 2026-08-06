@@ -26,7 +26,6 @@ class Handler(BaseHTTPRequestHandler):
                 language="pt",
                 beam_size=1,
                 vad_filter=True,
-                initial_prompt="Campeão, toca Wonderwall do Oasis aí.",
             )
             text = " ".join(s.text for s in segments).strip()
         body = json.dumps({"text": text}).encode()
