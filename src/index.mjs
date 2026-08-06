@@ -118,7 +118,12 @@ async function deezerLookup(query) {
     });
     const track = (await res.json()).data?.[0];
     if (!track?.title) return null;
-    return { artist: track.artist?.name ?? "", title: track.title, label: `${track.artist?.name} - ${track.title}` };
+    return {
+      artist: track.artist?.name ?? "",
+      title: track.title,
+      label: `${track.artist?.name} - ${track.title}`,
+      duration: track.duration || null,
+    };
   } catch (e) {
     console.log("[deezer] erro:", e.message);
     return null;
@@ -129,8 +134,8 @@ async function runYtdlp(args, target) {
   try {
     const { stdout } = await execFileP(
       "yt-dlp",
-      [...YTDLP_BASE, ...args, "-f", "bestaudio/best", "--print", "%(title)s\t%(webpage_url)s", target],
-      { timeout: 45000 },
+      [...YTDLP_BASE, ...args, "-f", "bestaudio/best", "--print", "%(title)s\t%(webpage_url)s\t%(channel)s\t%(duration)s", target],
+      { timeout: 60000 },
     );
     return stdout;
   } catch (e) {
@@ -139,14 +144,57 @@ async function runYtdlp(args, target) {
   }
 }
 
+function parseCandidates(stdout) {
+  return stdout
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [title, url, channel, duration] = line.split("\t");
+      return { title, url, channel: channel ?? "", duration: Number.parseFloat(duration) || null };
+    })
+    .filter((c) => c.url);
+}
+
+const REMIX_WORDS = [
+  "remix", "slowed", "reverb", "sped up", "speed up", "nightcore", "8d",
+  "cover", "karaoke", "instrumental", "live", "ao vivo", "mashup",
+  "bass boost", "loop", "1 hour", "10 hour", "tiktok",
+];
+
+function scoreCandidate(c, want) {
+  let score = 0;
+  const title = norm(c.title ?? "");
+  const channel = norm(c.channel ?? "");
+  const query = norm(want.query);
+  if (channel.endsWith("topic")) score += 5;
+  if (channel.includes("vevo")) score += 4;
+  if (channel.length >= 4 && query.includes(channel)) score += 2;
+  if (/\b(official|oficial)\b/.test(title)) score += 2;
+  for (const w of REMIX_WORDS) {
+    if (title.includes(w) && !query.includes(w)) score -= 4;
+  }
+  if (want.duration && c.duration) {
+    const diff = Math.abs(c.duration - want.duration);
+    if (diff <= 5) score += 6;
+    else if (diff <= 15) score += 3;
+    else if (diff > 60) score -= 3;
+  }
+  for (const w of query.split(" ")) {
+    if (w.length >= 3 && title.includes(w)) score += 0.5;
+  }
+  return score;
+}
+
 async function resolveTrack(query, source = "auto") {
   const isUrl = /^https?:\/\//.test(query);
   const tvArgs = ["--extractor-args", "youtube:player_client=tv"];
-  const yt = (q) => ({ label: "youtube", args: ["--no-playlist"], target: `ytsearch1:${q}` });
-  const yttv = (q) => ({ label: "youtube-tv", args: ["--no-playlist", ...tvArgs], target: `ytsearch1:${q}`, extra: tvArgs });
+  const yt = (q) => ({ label: "youtube", args: ["-i", "--no-playlist"], target: `ytsearch5:${q}` });
+  const yttv = (q) => ({ label: "youtube-tv", args: ["-i", "--no-playlist", ...tvArgs], target: `ytsearch5:${q}`, extra: tvArgs });
   const sc = (q) => ({ label: "soundcloud", args: ["-i"], target: `scsearch5:${q}` });
   let attempts;
   let forcedTitle = null;
+  let want = { query, duration: null };
   if (isUrl) {
     attempts = [{ label: "url", args: ["--no-playlist"], target: query }];
   } else if (source === "youtube") {
@@ -158,18 +206,23 @@ async function resolveTrack(query, source = "auto") {
     const refined = dz ? `${dz.artist} ${dz.title}` : query;
     if (dz) {
       forcedTitle = dz.label;
-      console.log(`[busca] deezer refinou: "${query}" -> "${refined}"`);
+      want = { query: refined, duration: dz.duration };
+      console.log(`[busca] deezer refinou: "${query}" -> "${refined}" (${dz.duration}s)`);
     }
-    attempts = [yt(refined), yttv(refined), sc(refined)];
+    attempts = [yt(want.query), yttv(want.query), sc(want.query)];
   }
   for (const attempt of attempts) {
     try {
       const stdout = await runYtdlp(attempt.args, attempt.target);
-      const line = stdout.trim().split("\n").filter(Boolean)[0];
-      const [title, url] = (line ?? "").split("\t");
-      if (url) {
-        console.log(`[busca] ${attempt.label} achou: ${title}`);
-        return { title: forcedTitle ?? title, url, extra: attempt.extra ?? [] };
+      const candidates = parseCandidates(stdout)
+        .map((c) => ({ ...c, score: scoreCandidate(c, want) }))
+        .sort((a, b) => b.score - a.score);
+      const best = candidates[0];
+      if (best) {
+        console.log(
+          `[busca] ${attempt.label}: ${candidates.map((c) => `${c.score.toFixed(1)} ${c.title?.slice(0, 50)}`).join(" | ")}`,
+        );
+        return { title: forcedTitle ?? best.title, url: best.url, extra: attempt.extra ?? [] };
       }
     } catch (e) {
       const err = (e.stderr || e.message || "").toString().replace(/\s+/g, " ").slice(0, 250);
