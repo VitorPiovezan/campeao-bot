@@ -74,6 +74,15 @@ function editDistance(a, b) {
 
 const isWakeWord = (w) => WAKE_WORDS.includes(w) || (w.length >= 6 && editDistance(w, "campeao") <= 2);
 
+const PLAY_VERBS = ["toca", "tocar", "toque", "coloca", "colocar", "bota", "botar", "poe", "play", "manda", "mandar"];
+const SKIP_VERBS = ["pula", "pular", "proxima", "passa", "passar", "skip", "next"];
+const PAUSE_VERBS = ["pausa", "pausar", "pause"];
+const RESUME_VERBS = ["continua", "continuar", "volta", "voltar", "despausa", "resume"];
+const STOP_VERBS = ["para", "parar", "pare", "stop", "chega"];
+const LEAVE_VERBS = ["sai", "sair", "vaza", "tchau", "xau", "embora"];
+const matchVerb = (w, verbs) =>
+  verbs.some((v) => w === v || (w.length >= 4 && v.length >= 4 && editDistance(w, v) <= 1));
+
 const norm = (s) =>
   s
     .toLowerCase()
@@ -199,6 +208,7 @@ async function enqueue(gs, query, by) {
 function stopAll(gs) {
   gs.queue = [];
   gs.current = null;
+  gs.currentResource = null;
   killProcs(gs);
   unduck(gs);
   gs.player.stop();
@@ -353,10 +363,13 @@ function handleVoice(gs, userId, raw, startedAt) {
     return;
   }
 
-  const playMatch = rest.match(/^(?:ai |ei |vai |ow )?(?:toca|toque|coloca|bota|poe|play|manda)\s+(.+)/);
-  if (playMatch) {
-    const query = playMatch[1]
-      .replace(/^(a musica |o som |a |o |um |uma )/, "")
+  const restWords = rest.split(" ").filter((w) => !["ai", "ei", "vai", "ow", "o"].includes(w));
+  const head = restWords[0] ?? "";
+  const tail = restWords.slice(1).join(" ");
+
+  if (matchVerb(head, PLAY_VERBS)) {
+    const query = tail
+      .replace(/^(a musica |o som |a |um |uma )/, "")
       .replace(/\s+(ai|por favor|pra mim|pra gente|rapidao|agora)$/, "")
       .trim();
     if (!query) return;
@@ -365,29 +378,29 @@ function handleVoice(gs, userId, raw, startedAt) {
     enqueue(gs, query, mention);
     return;
   }
-  if (/^(pula|proxima|passa|skip|next)/.test(rest)) {
+  if (matchVerb(head, SKIP_VERBS)) {
     unduck(gs);
     gs.textChannel?.send(`⏭️ ${mention} pulou a música`).catch(() => {});
     playNext(gs);
     return;
   }
-  if (/^pausa/.test(rest)) {
+  if (matchVerb(head, PAUSE_VERBS)) {
     gs.player.pause();
     gs.textChannel?.send(`⏸️ ${mention} pausou a música`).catch(() => {});
     return;
   }
-  if (/^(continua|volta|despausa|resume)/.test(rest)) {
+  if (matchVerb(head, RESUME_VERBS)) {
     unduck(gs);
     gs.player.unpause();
     gs.textChannel?.send(`▶️ ${mention} despausou a música`).catch(() => {});
     return;
   }
-  if (/^(para|pare|stop|chega|cala)/.test(rest)) {
+  if (matchVerb(head, STOP_VERBS) || /^cala/.test(head)) {
     stopAll(gs);
     gs.textChannel?.send(`⏹️ ${mention} parou a música`).catch(() => {});
     return;
   }
-  if (/^(sai|vaza|tchau|xau|embora)/.test(rest)) {
+  if (LEAVE_VERBS.includes(head)) {
     gs.textChannel?.send(`👋 Falou, ${mention}!`).catch(() => {});
     leave(gs);
     return;
@@ -420,7 +433,8 @@ function joinFor(member, channel) {
   gs.connection.on("error", (e) => console.log("[voz] erro de conexão:", e.message));
   gs.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
   gs.connection.subscribe(gs.player);
-  gs.player.on(AudioPlayerStatus.Idle, () => {
+  gs.player.on(AudioPlayerStatus.Idle, (oldState) => {
+    if (oldState.resource !== gs.currentResource) return;
     if (gs.current) playNext(gs);
   });
   gs.player.on("error", (e) => {
