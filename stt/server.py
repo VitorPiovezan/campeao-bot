@@ -6,9 +6,10 @@ import numpy as np
 from faster_whisper import WhisperModel
 
 model = WhisperModel(
-    os.environ.get("WHISPER_MODEL", "small"),
+    os.environ.get("WHISPER_MODEL", "base"),
     device="cpu",
     compute_type="int8",
+    cpu_threads=int(os.environ.get("WHISPER_THREADS", "4")),
 )
 
 

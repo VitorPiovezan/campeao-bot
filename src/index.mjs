@@ -16,7 +16,7 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const STT_URL = "http://127.0.0.1:5005/";
 const JOCKIE_PREFIX = process.env.JOCKIE_PREFIX ?? "m!";
 const WAKE_WORDS = ["campeao", "campiao", "capiao", "campeaum", "campeon", "campeao"];
-const ATTENTION_MS = 10000;
+const ATTENTION_MS = 2500;
 const BEEP_FILE = "/tmp/beep.pcm";
 
 const guilds = new Map();
@@ -108,9 +108,10 @@ function captureUtterance(gs, userId) {
   const user = client.users.cache.get(userId);
   if (user?.bot) return;
   gs.listening.add(userId);
+  const startedAt = Date.now();
   console.log(`[voz] capturando ${user?.username ?? userId}`);
   const opus = gs.connection.receiver.subscribe(userId, {
-    end: { behavior: EndBehaviorType.AfterSilence, duration: 900 },
+    end: { behavior: EndBehaviorType.AfterSilence, duration: 600 },
   });
   const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
   const chunks = [];
@@ -129,21 +130,21 @@ function captureUtterance(gs, userId) {
     const pcm = Buffer.concat(chunks);
     const secs = (pcm.length / (48000 * 2 * 2)).toFixed(1);
     console.log(`[voz] utterance de ${user?.username ?? userId}: ${secs}s`);
-    if (pcm.length < 48000 * 2 * 2 * 0.3) return;
+    if (pcm.length < 48000 * 2 * 2 * 0.6) return;
     const text = await transcribe(to16kMono(pcm));
     console.log(`[stt] ${user?.username ?? userId}: "${text}"`);
-    if (text) handleVoice(gs, userId, text);
+    if (text) handleVoice(gs, userId, text, startedAt);
   });
   decoder.on("error", cleanup);
   opus.on("error", cleanup);
 }
 
-function handleVoice(gs, userId, raw) {
+function handleVoice(gs, userId, raw, startedAt) {
   const text = norm(raw);
   if (!text) return;
   const words = text.split(" ");
   const wakeIdx = words.findIndex((w) => WAKE_WORDS.includes(w));
-  const attentive = (gs.attention.get(userId) ?? 0) > Date.now();
+  const attentive = (gs.attention.get(userId) ?? 0) > startedAt;
   let rest;
   if (wakeIdx !== -1 && wakeIdx <= 4) {
     rest = words.slice(wakeIdx + 1).join(" ");
@@ -159,7 +160,6 @@ function handleVoice(gs, userId, raw) {
   if (rest === "" || /^(oi|ola|fala|ei)$/.test(rest)) {
     gs.attention.set(userId, Date.now() + ATTENTION_MS);
     playBeep(gs);
-    gs.textChannel?.send(`👂 Oi ${mention}! Pode pedir: "toca <música>"`).catch(() => {});
     return;
   }
 
@@ -201,8 +201,7 @@ function handleVoice(gs, userId, raw) {
     leave(gs);
     return;
   }
-  gs.attention.set(userId, Date.now() + ATTENTION_MS);
-  playBeep(gs);
+  console.log(`[wake] não entendi: "${rest}"`);
 }
 
 function leave(gs) {
@@ -227,6 +226,9 @@ function joinFor(member, channel) {
   });
   gs.connection.on("stateChange", (oldS, newS) => {
     console.log(`[voz] conexão: ${oldS.status} -> ${newS.status}`);
+    if (newS.status === "destroyed" || newS.status === "disconnected") {
+      guilds.delete(gs.guildId);
+    }
   });
   gs.connection.on("error", (e) => console.log("[voz] erro de conexão:", e.message));
   gs.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
