@@ -1,10 +1,8 @@
-import { spawn, execFile, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { Readable } from "node:stream";
-import { promisify } from "node:util";
 import { Client, Events, GatewayIntentBits } from "discord.js";
 import {
-  AudioPlayerStatus,
   createAudioPlayer,
   createAudioResource,
   EndBehaviorType,
@@ -14,12 +12,11 @@ import {
 } from "@discordjs/voice";
 import prism from "prism-media";
 
-const execFileP = promisify(execFile);
 const TOKEN = process.env.DISCORD_TOKEN;
 const STT_URL = "http://127.0.0.1:5005/";
-const WAKE_WORDS = ["campeao", "campiao", "capiao", "campeaum", "campeon"];
+const JOCKIE_PREFIX = process.env.JOCKIE_PREFIX ?? "m!";
+const WAKE_WORDS = ["campeao", "campiao", "capiao", "campeaum", "campeon", "campeao"];
 const ATTENTION_MS = 10000;
-const DUCK_VOLUME = 0.15;
 const BEEP_FILE = "/tmp/beep.pcm";
 
 const guilds = new Map();
@@ -41,14 +38,9 @@ function getState(guildId) {
       guildId,
       connection: null,
       player: null,
-      queue: [],
-      current: null,
-      currentResource: null,
-      procs: [],
       textChannel: null,
       listening: new Set(),
       attention: new Map(),
-      duckTimer: null,
     });
   }
   return guilds.get(guildId);
@@ -63,102 +55,20 @@ const norm = (s) =>
     .replace(/\s+/g, " ")
     .trim();
 
-function killProcs(gs) {
-  for (const p of gs.procs) {
-    try { p.kill("SIGKILL"); } catch {}
-  }
-  gs.procs = [];
-}
-
-async function resolveTrack(query) {
-  const isUrl = /^https?:\/\//.test(query);
-  const targets = isUrl ? [query] : [`ytsearch1:${query}`, `scsearch1:${query}`];
-  for (const target of targets) {
-    try {
-      const { stdout } = await execFileP(
-        "yt-dlp",
-        ["--no-playlist", "--print", "%(title)s", "--print", "%(webpage_url)s", target],
-        { timeout: 30000 },
-      );
-      const [title, url] = stdout.trim().split("\n");
-      if (url) return { title, url };
-    } catch {}
-  }
-  return null;
-}
-
-function playNext(gs) {
-  killProcs(gs);
-  const next = gs.queue.shift();
-  gs.current = next ?? null;
-  gs.currentResource = null;
-  if (!next) return;
-  const ytdlp = spawn("yt-dlp", ["-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", next.url]);
-  const ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"]);
-  ytdlp.stderr.resume();
-  ytdlp.stdout.pipe(ff.stdin);
-  ff.stdin.on("error", () => {});
-  ytdlp.on("error", () => {});
-  ff.on("error", () => {});
-  gs.procs = [ytdlp, ff];
-  const resource = createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
-  gs.currentResource = resource;
-  gs.player.play(resource);
-  gs.textChannel?.send(`▶️ Tocando agora: **${next.title}** (pedido por ${next.by})`).catch(() => {});
-}
-
 function playBeep(gs) {
-  if (gs.current) {
-    duck(gs);
-    return;
-  }
   try {
     const resource = createAudioResource(Readable.from([readFileSync(BEEP_FILE)]), {
       inputType: StreamType.Raw,
     });
     gs.player.play(resource);
-  } catch {}
-}
-
-function duck(gs) {
-  if (!gs.currentResource?.volume) return;
-  gs.currentResource.volume.setVolume(DUCK_VOLUME);
-  if (gs.duckTimer) clearTimeout(gs.duckTimer);
-  gs.duckTimer = setTimeout(() => unduck(gs), ATTENTION_MS);
-}
-
-function unduck(gs) {
-  if (gs.duckTimer) clearTimeout(gs.duckTimer);
-  gs.duckTimer = null;
-  gs.currentResource?.volume?.setVolume(1);
-}
-
-async function enqueue(gs, query, by) {
-  const track = await resolveTrack(query);
-  if (!track) {
-    gs.textChannel?.send(`😔 Não achei nada pra "${query}"`).catch(() => {});
-    return;
-  }
-  track.by = by;
-  gs.queue.push(track);
-  if (gs.player.state.status === AudioPlayerStatus.Idle || !gs.current) {
-    playNext(gs);
-  } else {
-    gs.textChannel?.send(`➕ Na fila (#${gs.queue.length}): **${track.title}**`).catch(() => {});
+  } catch (e) {
+    console.log("[beep] falhou:", e.message);
   }
 }
 
-function stopAll(gs) {
-  gs.queue = [];
-  gs.current = null;
-  killProcs(gs);
-  gs.player.stop();
-}
-
-function leave(gs) {
-  stopAll(gs);
-  try { gs.connection?.destroy(); } catch {}
-  guilds.delete(gs.guildId);
+function sendJockie(gs, command) {
+  console.log(`[jockie] enviando: ${JOCKIE_PREFIX}${command}`);
+  gs.textChannel?.send(`${JOCKIE_PREFIX}${command}`).catch((e) => console.log("[jockie] erro:", e.message));
 }
 
 function to16kMono(pcm) {
@@ -182,15 +92,15 @@ async function transcribe(pcm) {
       headers: { "content-type": "application/octet-stream" },
       signal: AbortSignal.timeout(30000),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.log("[stt] resposta", res.status);
+      return null;
+    }
     return (await res.json()).text;
-  } catch {
+  } catch (e) {
+    console.log("[stt] erro:", e.message);
     return null;
   }
-}
-
-function attachListener(gs) {
-  gs.connection.receiver.speaking.on("start", (userId) => captureUtterance(gs, userId));
 }
 
 function captureUtterance(gs, userId) {
@@ -198,6 +108,7 @@ function captureUtterance(gs, userId) {
   const user = client.users.cache.get(userId);
   if (user?.bot) return;
   gs.listening.add(userId);
+  console.log(`[voz] capturando ${user?.username ?? userId}`);
   const opus = gs.connection.receiver.subscribe(userId, {
     end: { behavior: EndBehaviorType.AfterSilence, duration: 900 },
   });
@@ -209,19 +120,25 @@ function captureUtterance(gs, userId) {
     bytes += c.length;
     if (bytes < 48000 * 2 * 2 * 15) chunks.push(c);
   });
-  const cleanup = () => gs.listening.delete(userId);
+  const cleanup = (e) => {
+    if (e) console.log("[voz] erro no stream:", e.message);
+    gs.listening.delete(userId);
+  };
   decoder.on("end", async () => {
-    cleanup();
+    gs.listening.delete(userId);
     const pcm = Buffer.concat(chunks);
-    if (pcm.length < 48000 * 2 * 2 * 0.5) return;
+    const secs = (pcm.length / (48000 * 2 * 2)).toFixed(1);
+    console.log(`[voz] utterance de ${user?.username ?? userId}: ${secs}s`);
+    if (pcm.length < 48000 * 2 * 2 * 0.3) return;
     const text = await transcribe(to16kMono(pcm));
-    if (text) await handleVoice(gs, userId, text);
+    console.log(`[stt] ${user?.username ?? userId}: "${text}"`);
+    if (text) handleVoice(gs, userId, text);
   });
   decoder.on("error", cleanup);
   opus.on("error", cleanup);
 }
 
-async function handleVoice(gs, userId, raw) {
+function handleVoice(gs, userId, raw) {
   const text = norm(raw);
   if (!text) return;
   const words = text.split(" ");
@@ -236,6 +153,7 @@ async function handleVoice(gs, userId, raw) {
     return;
   }
   gs.attention.delete(userId);
+  console.log(`[wake] comando: "${rest}"`);
   const mention = `<@${userId}>`;
 
   if (rest === "" || /^(oi|ola|fala|ei)$/.test(rest)) {
@@ -252,38 +170,46 @@ async function handleVoice(gs, userId, raw) {
       .replace(/\s+(ai|por favor|pra mim|pra gente|rapidao|agora)$/, "")
       .trim();
     if (!query) return;
-    unduck(gs);
+    playBeep(gs);
     gs.textChannel?.send(`🎤 ${mention} pediu: **${query}**`).catch(() => {});
-    await enqueue(gs, query, mention);
+    sendJockie(gs, `play ${query}`);
     return;
   }
   if (/^(pula|proxima|passa|skip|next)/.test(rest)) {
-    unduck(gs);
-    gs.textChannel?.send(`⏭️ ${mention} pulou a música`).catch(() => {});
-    playNext(gs);
+    playBeep(gs);
+    sendJockie(gs, "skip");
     return;
   }
   if (/^pausa/.test(rest)) {
-    gs.player.pause();
+    playBeep(gs);
+    sendJockie(gs, "pause");
     return;
   }
   if (/^(continua|volta|despausa|resume)/.test(rest)) {
-    unduck(gs);
-    gs.player.unpause();
+    playBeep(gs);
+    sendJockie(gs, "resume");
     return;
   }
   if (/^(para|pare|stop|chega|cala)/.test(rest)) {
-    stopAll(gs);
-    gs.textChannel?.send(`⏹️ ${mention} parou a música`).catch(() => {});
+    playBeep(gs);
+    sendJockie(gs, "stop");
     return;
   }
   if (/^(sai|vaza|tchau|xau|embora)/.test(rest)) {
-    gs.textChannel?.send(`👋 Falou! ${mention} me dispensou`).catch(() => {});
+    gs.textChannel?.send(`👋 Falou, ${mention}!`).catch(() => {});
+    sendJockie(gs, "leave");
     leave(gs);
     return;
   }
   gs.attention.set(userId, Date.now() + ATTENTION_MS);
   playBeep(gs);
+}
+
+function leave(gs) {
+  try {
+    gs.connection?.destroy();
+  } catch {}
+  guilds.delete(gs.guildId);
 }
 
 function joinFor(member, channel) {
@@ -299,14 +225,14 @@ function joinFor(member, channel) {
     selfDeaf: false,
     selfMute: false,
   });
+  gs.connection.on("stateChange", (oldS, newS) => {
+    console.log(`[voz] conexão: ${oldS.status} -> ${newS.status}`);
+  });
+  gs.connection.on("error", (e) => console.log("[voz] erro de conexão:", e.message));
   gs.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
   gs.connection.subscribe(gs.player);
-  gs.player.on(AudioPlayerStatus.Idle, () => {
-    if (gs.current) playNext(gs);
-  });
-  gs.player.on("error", () => playNext(gs));
-  gs.connection.on("error", () => {});
-  attachListener(gs);
+  gs.connection.receiver.speaking.on("start", (userId) => captureUtterance(gs, userId));
+  console.log(`[voz] entrei em "${voice.name}" (${member.guild.name})`);
   return gs;
 }
 
@@ -319,51 +245,27 @@ const client = new Client({
   ],
 });
 
-client.on(Events.MessageCreate, async (m) => {
+client.on(Events.MessageCreate, (m) => {
   if (m.author.bot || !m.guild || !m.content.startsWith("!")) return;
-  const [cmd, ...args] = m.content.slice(1).trim().split(/\s+/);
-  const query = args.join(" ");
+  const [cmd] = m.content.slice(1).trim().split(/\s+/);
   const command = cmd.toLowerCase();
 
-  if (["entra", "play", "p", "toca"].includes(command)) {
+  if (command === "entra") {
     const gs = joinFor(m.member, m.channel);
     if (!gs) {
       m.reply("Entra num canal de voz primeiro! 🎧").catch(() => {});
       return;
     }
-    if (command === "entra") {
-      m.reply('Cheguei! 🏆 Pede por voz ("CAMPEÃO, TOCA...") ou com `!play <música>`').catch(() => {});
-      return;
-    }
-    if (!query) {
-      m.reply("Fala qual música: `!play wonderwall oasis`").catch(() => {});
-      return;
-    }
-    await enqueue(gs, query, `${m.author}`);
-    return;
-  }
-
-  const gs = guilds.get(m.guild.id);
-  if (!gs) return;
-  gs.textChannel = m.channel;
-
-  if (["pula", "skip", "proxima"].includes(command)) playNext(gs);
-  else if (["para", "stop"].includes(command)) stopAll(gs);
-  else if (command === "pausa") gs.player.pause();
-  else if (["continua", "resume"].includes(command)) gs.player.unpause();
-  else if (command === "fila") {
-    const lines = [
-      gs.current ? `▶️ **${gs.current.title}**` : "Nada tocando",
-      ...gs.queue.map((t, i) => `${i + 1}. ${t.title}`),
-    ];
-    m.reply(lines.join("\n").slice(0, 1900)).catch(() => {});
-  } else if (["sai", "sair"].includes(command)) leave(gs);
-  else if (command === "ajuda") {
+    m.reply('Cheguei! 🏆 Fala "CAMPEÃO, TOCA <música>" que eu passo pro Jockie').catch(() => {});
+  } else if (command === "sai") {
+    const gs = guilds.get(m.guild.id);
+    if (gs) leave(gs);
+  } else if (command === "ajuda") {
     m.reply(
       [
-        "**Por voz** (com o Campeão no canal): \"CAMPEÃO, TOCA <música>\" — também: pula, pausa, continua, para, sai",
-        "Se tiver música alta, fala só \"CAMPEÃO\" — eu abaixo o som e fico te ouvindo por 10s",
-        "**Por texto**: `!entra` `!play <música>` `!pula` `!pausa` `!continua` `!para` `!fila` `!sai`",
+        '**Por voz** (comigo no canal): "CAMPEÃO, TOCA <música>" — também: pula, pausa, continua, para, sai',
+        `Eu não toco nada: eu escuto e mando \`${JOCKIE_PREFIX}play\` pro Jockie Music tocar`,
+        "**Por texto**: `!entra` `!sai` `!ajuda`",
       ].join("\n"),
     ).catch(() => {});
   }
