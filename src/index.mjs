@@ -71,24 +71,42 @@ function killProcs(gs) {
   gs.procs = [];
 }
 
+async function runYtdlp(args, target) {
+  try {
+    const { stdout } = await execFileP(
+      "yt-dlp",
+      ["--js-runtimes", "node", ...args, "-f", "bestaudio/best", "--print", "%(title)s\t%(webpage_url)s", target],
+      { timeout: 45000 },
+    );
+    return stdout;
+  } catch (e) {
+    if (e.stdout?.trim()) return e.stdout;
+    throw e;
+  }
+}
+
 async function resolveTrack(query) {
   const isUrl = /^https?:\/\//.test(query);
-  const targets = isUrl ? [query] : [`ytsearch1:${query}`, `scsearch1:${query}`];
-  for (const target of targets) {
+  const tvArgs = ["--extractor-args", "youtube:player_client=tv"];
+  const attempts = isUrl
+    ? [{ label: "url", args: ["--no-playlist"], target: query }]
+    : [
+        { label: "youtube", args: ["--no-playlist"], target: `ytsearch1:${query}` },
+        { label: "youtube-tv", args: ["--no-playlist", ...tvArgs], target: `ytsearch1:${query}`, extra: tvArgs },
+        { label: "soundcloud", args: ["-i"], target: `scsearch5:${query}` },
+      ];
+  for (const attempt of attempts) {
     try {
-      const { stdout } = await execFileP(
-        "yt-dlp",
-        ["--js-runtimes", "node", "--no-playlist", "--print", "%(title)s", "--print", "%(webpage_url)s", target],
-        { timeout: 30000 },
-      );
-      const [title, url] = stdout.trim().split("\n");
+      const stdout = await runYtdlp(attempt.args, attempt.target);
+      const line = stdout.trim().split("\n").filter(Boolean)[0];
+      const [title, url] = (line ?? "").split("\t");
       if (url) {
-        console.log(`[busca] "${query}" -> ${title}`);
-        return { title, url };
+        console.log(`[busca] ${attempt.label} achou: ${title}`);
+        return { title, url, extra: attempt.extra ?? [] };
       }
     } catch (e) {
-      const err = (e.stderr || e.message || "").toString().replace(/\s+/g, " ").slice(0, 300);
-      console.log(`[busca] ${target} falhou: ${err}`);
+      const err = (e.stderr || e.message || "").toString().replace(/\s+/g, " ").slice(0, 250);
+      console.log(`[busca] ${attempt.label} falhou: ${err}`);
     }
   }
   return null;
@@ -102,7 +120,7 @@ function playNext(gs) {
   gs.currentResource = null;
   if (!next) return;
   console.log(`[player] tocando: ${next.title}`);
-  const ytdlp = spawn("yt-dlp", ["--js-runtimes", "node", "-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", next.url]);
+  const ytdlp = spawn("yt-dlp", ["--js-runtimes", "node", ...(next.extra ?? []), "-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", next.url]);
   const ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"]);
   ytdlp.stderr.on("data", (d) => console.log(`[yt-dlp] ${d.toString().trim().slice(0, 200)}`));
   ytdlp.stdout.pipe(ff.stdin);
