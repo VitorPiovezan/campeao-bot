@@ -78,7 +78,7 @@ async function resolveTrack(query) {
     try {
       const { stdout } = await execFileP(
         "yt-dlp",
-        ["--no-playlist", "--print", "%(title)s", "--print", "%(webpage_url)s", target],
+        ["--js-runtimes", "node", "--no-playlist", "--print", "%(title)s", "--print", "%(webpage_url)s", target],
         { timeout: 30000 },
       );
       const [title, url] = stdout.trim().split("\n");
@@ -102,7 +102,7 @@ function playNext(gs) {
   gs.currentResource = null;
   if (!next) return;
   console.log(`[player] tocando: ${next.title}`);
-  const ytdlp = spawn("yt-dlp", ["-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", next.url]);
+  const ytdlp = spawn("yt-dlp", ["--js-runtimes", "node", "-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", next.url]);
   const ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"]);
   ytdlp.stderr.on("data", (d) => console.log(`[yt-dlp] ${d.toString().trim().slice(0, 200)}`));
   ytdlp.stdout.pipe(ff.stdin);
