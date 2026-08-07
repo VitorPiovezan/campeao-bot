@@ -22,6 +22,7 @@ const COOKIES_FILE = "/data/cookies.txt";
 const hasCookies = existsSync(COOKIES_FILE);
 const YTDLP_BASE = [
   "--js-runtimes", "node",
+  "--remote-components", "ejs:github",
   ...(hasCookies ? ["--cookies", COOKIES_FILE] : []),
   ...(POT_URL ? ["--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_URL}`] : []),
 ];

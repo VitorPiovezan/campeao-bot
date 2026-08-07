@@ -11,5 +11,6 @@ COPY package.json ./
 RUN npm install --omit=dev
 COPY . .
 ENV HF_HOME=/data/hf
+ENV XDG_CACHE_HOME=/data/cache
 VOLUME /data
 CMD ["bash", "start.sh"]
