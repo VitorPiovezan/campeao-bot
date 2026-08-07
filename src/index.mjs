@@ -163,7 +163,7 @@ const REMIX_WORDS = [
   "bass boost", "loop", "1 hour", "10 hour", "tiktok",
 ];
 
-function scoreCandidate(c, want) {
+function scoreCandidate(c, want, opts = {}) {
   let score = 0;
   const title = norm(c.title ?? "");
   const channel = norm(c.channel ?? "");
@@ -171,7 +171,8 @@ function scoreCandidate(c, want) {
   if (channel.endsWith("topic")) score += 5;
   if (channel.includes("vevo")) score += 4;
   if (channel.length >= 4 && query.includes(channel)) score += 2;
-  if (/\b(official|oficial)\b/.test(title)) score += 2;
+  if (!opts.soundcloud && /\b(official|oficial)\b/.test(title)) score += 2;
+  if (/tiktok|\d{4,}/.test(channel)) score -= 3;
   for (const w of REMIX_WORDS) {
     if (title.includes(w) && !query.includes(w)) score -= 4;
   }
@@ -179,7 +180,7 @@ function scoreCandidate(c, want) {
     const diff = Math.abs(c.duration - want.duration);
     if (diff <= 5) score += 6;
     else if (diff <= 15) score += 3;
-    else if (diff > 60) score -= 3;
+    else if (diff > 25) score -= 8;
   }
   for (const w of query.split(" ")) {
     if (w.length >= 3 && title.includes(w)) score += 0.5;
@@ -218,7 +219,7 @@ async function resolveTrack(query, source = "auto") {
       for (const cand of flat.slice(0, 3)) {
         try {
           const ok = parseCandidates(await runYtdlp(["--no-playlist", "-f", "bestaudio/best", ...PRINT_FULL, cand.url]))[0];
-          if (ok) return { title: forcedTitle ?? ok.title, url: ok.url };
+          if (ok) return { title: forcedTitle ?? ok.title, url: ok.url, source: "youtube" };
         } catch (e) {
           const err = shortErr(e);
           console.log(`[busca] validação falhou: ${err}`);
@@ -232,12 +233,12 @@ async function resolveTrack(query, source = "auto") {
   if (source !== "youtube") {
     try {
       const candidates = parseCandidates(await runYtdlp(["-i", "-f", "bestaudio/best", ...PRINT_FULL, `scsearch5:${want.query}`]))
-        .map((c) => ({ ...c, score: scoreCandidate(c, want) }))
+        .map((c) => ({ ...c, score: scoreCandidate(c, want, { soundcloud: true }) }))
         .sort((a, b) => b.score - a.score);
       const best = candidates[0];
       if (best) {
         console.log(`[busca] soundcloud: ${candidates.map((c) => `${c.score.toFixed(1)} ${c.title?.slice(0, 45)}`).join(" | ")}`);
-        return { title: forcedTitle ?? best.title, url: best.url };
+        return { title: forcedTitle ?? best.title, url: best.url, source: "soundcloud" };
       }
     } catch (e) {
       console.log(`[busca] soundcloud falhou: ${shortErr(e)}`);
@@ -265,7 +266,8 @@ function playNext(gs) {
   const resource = createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
   gs.currentResource = resource;
   gs.player.play(resource);
-  gs.textChannel?.send(`▶️ Tocando agora: **${next.title}** (pedido por ${next.by}) — <${next.url}>`).catch(() => {});
+  const sourceTag = next.source === "soundcloud" ? " · via SoundCloud ⚠️" : "";
+  gs.textChannel?.send(`▶️ Tocando agora: **${next.title}** (pedido por ${next.by})${sourceTag} — <${next.url}>`).catch(() => {});
 }
 
 function playBeep(gs) {
@@ -634,6 +636,23 @@ client.on(Events.MessageCreate, async (m) => {
 client.once(Events.ClientReady, () => {
   console.log(`Campeão online como ${client.user.tag}`);
 });
+
+async function selfTestYoutube() {
+  try {
+    const { stdout, stderr } = await execFileP(
+      "yt-dlp",
+      [...YTDLP_BASE, "-v", "--simulate", "--no-playlist", "-f", "bestaudio/best", "--print", "%(title)s", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+      { timeout: 60000 },
+    );
+    const potActive = /bgutil|youtubepot|po_token/i.test(`${stderr}`) ? "POT ativo" : "POT NÃO detectado";
+    console.log(`[selftest] youtube OK (${potActive}): ${stdout.trim().slice(0, 60)}`);
+  } catch (e) {
+    const err = `${e.stderr || ""}${e.message || ""}`;
+    const potSeen = /bgutil|youtubepot/i.test(err) ? "plugin visível" : "plugin NÃO visível";
+    console.log(`[selftest] youtube FALHOU (${potSeen}): ${err.replace(/\s+/g, " ").slice(0, 400)}`);
+  }
+}
+setTimeout(selfTestYoutube, 8000);
 
 try {
   ensureBeep();
