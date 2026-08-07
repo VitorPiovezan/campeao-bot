@@ -698,7 +698,15 @@ function wavFrom(pcm) {
   return Buffer.concat([h, pcm]);
 }
 
+const groqHits = [];
+function groqSlotFree() {
+  const cutoff = Date.now() - 60000;
+  while (groqHits.length && groqHits[0] < cutoff) groqHits.shift();
+  return groqHits.length < 18;
+}
+
 async function groqTranscribe(pcm) {
+  groqHits.push(Date.now());
   const fd = new FormData();
   fd.append("file", new Blob([wavFrom(pcm)], { type: "audio/wav" }), "audio.wav");
   fd.append("model", "whisper-large-v3-turbo");
@@ -744,7 +752,12 @@ async function transcribe(pcm, priority = false) {
   }
   sttPending++;
   try {
-    return GROQ_KEY ? await groqTranscribe(pcm) : await localTranscribe(pcm);
+    if (!GROQ_KEY) return await localTranscribe(pcm);
+    if (!groqSlotFree()) {
+      console.log("[stt] cota da groq no limite, usando whisper local");
+      return await localTranscribe(pcm);
+    }
+    return await groqTranscribe(pcm);
   } catch (e) {
     console.log("[stt] erro:", e.message);
     return null;
