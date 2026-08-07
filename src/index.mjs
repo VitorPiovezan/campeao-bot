@@ -20,6 +20,7 @@ const POT_URL = process.env.POT_PROVIDER_URL;
 const GROQ_KEY = process.env.GROQ_API_KEY;
 const YTDLP_BASE = [
   "--js-runtimes", "node",
+  "--extractor-args", "youtube:player_client=mweb,web",
   ...(POT_URL ? ["--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_URL}`] : []),
 ];
 const STT_URL = "http://127.0.0.1:5005/";
@@ -125,6 +126,7 @@ async function deezerLookup(query) {
       title: track.title,
       label: `${track.artist?.name} - ${track.title}`,
       duration: track.duration || null,
+      cover: track.album?.cover_big ?? null,
     };
   } catch (e) {
     console.log("[deezer] erro:", e.message);
@@ -142,8 +144,8 @@ async function runYtdlp(args) {
   }
 }
 
-const PRINT_FULL = ["--print", "%(title)s\t%(webpage_url)s\t%(channel)s\t%(duration)s"];
-const PRINT_FLAT = ["--print", "%(title)s\t%(url)s\t%(channel)s\t%(duration)s"];
+const PRINT_FULL = ["--print", "%(title)s\t%(webpage_url)s\t%(channel)s\t%(duration)s\t%(thumbnail)s"];
+const PRINT_FLAT = ["--print", "%(title)s\t%(url)s\t%(channel)s\t%(duration)s\t%(thumbnail)s"];
 
 function parseCandidates(stdout) {
   return stdout
@@ -151,8 +153,14 @@ function parseCandidates(stdout) {
     .split("\n")
     .filter(Boolean)
     .map((line) => {
-      const [title, url, channel, duration] = line.split("\t");
-      return { title, url, channel: channel ?? "", duration: Number.parseFloat(duration) || null };
+      const [title, url, channel, duration, thumbnail] = line.split("\t");
+      return {
+        title,
+        url,
+        channel: channel === "NA" ? "" : (channel ?? ""),
+        duration: Number.parseFloat(duration) || null,
+        thumbnail: thumbnail && thumbnail !== "NA" ? thumbnail : null,
+      };
     })
     .filter((c) => c.url);
 }
@@ -194,20 +202,21 @@ async function resolveTrack(query, source = "auto") {
   if (/^https?:\/\//.test(query)) {
     try {
       const c = parseCandidates(await runYtdlp(["--no-playlist", "-f", "bestaudio/best", ...PRINT_FULL, query]))[0];
-      return c ? { title: c.title, url: c.url } : null;
+      return c ? { title: c.title, url: c.url, source: "url", thumb: c.thumbnail, duration: c.duration } : null;
     } catch (e) {
       console.log(`[busca] url falhou: ${shortErr(e)}`);
       return null;
     }
   }
   let forcedTitle = null;
+  let dzMeta = null;
   let want = { query, duration: null };
   if (source !== "youtube" && source !== "soundcloud") {
-    const dz = await deezerLookup(query);
-    if (dz) {
-      forcedTitle = dz.label;
-      want = { query: `${dz.artist} ${dz.title}`, duration: dz.duration };
-      console.log(`[busca] deezer refinou: "${query}" -> "${want.query}" (${dz.duration}s)`);
+    dzMeta = await deezerLookup(query);
+    if (dzMeta) {
+      forcedTitle = dzMeta.label;
+      want = { query: `${dzMeta.artist} ${dzMeta.title}`, duration: dzMeta.duration };
+      console.log(`[busca] deezer refinou: "${query}" -> "${want.query}" (${dzMeta.duration}s)`);
     }
   }
   if (source !== "soundcloud") {
@@ -219,7 +228,15 @@ async function resolveTrack(query, source = "auto") {
       for (const cand of flat.slice(0, 3)) {
         try {
           const ok = parseCandidates(await runYtdlp(["--no-playlist", "-f", "bestaudio/best", ...PRINT_FULL, cand.url]))[0];
-          if (ok) return { title: forcedTitle ?? ok.title, url: ok.url, source: "youtube" };
+          if (ok) {
+            return {
+              title: forcedTitle ?? ok.title,
+              url: ok.url,
+              source: "youtube",
+              thumb: dzMeta?.cover ?? ok.thumbnail,
+              duration: dzMeta?.duration ?? ok.duration,
+            };
+          }
         } catch (e) {
           const err = shortErr(e);
           console.log(`[busca] validação falhou: ${err}`);
@@ -238,7 +255,13 @@ async function resolveTrack(query, source = "auto") {
       const best = candidates[0];
       if (best) {
         console.log(`[busca] soundcloud: ${candidates.map((c) => `${c.score.toFixed(1)} ${c.title?.slice(0, 45)}`).join(" | ")}`);
-        return { title: forcedTitle ?? best.title, url: best.url, source: "soundcloud" };
+        return {
+          title: forcedTitle ?? best.title,
+          url: best.url,
+          source: "soundcloud",
+          thumb: dzMeta?.cover ?? best.thumbnail,
+          duration: dzMeta?.duration ?? best.duration,
+        };
       }
     } catch (e) {
       console.log(`[busca] soundcloud falhou: ${shortErr(e)}`);
@@ -266,8 +289,40 @@ function playNext(gs) {
   const resource = createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
   gs.currentResource = resource;
   gs.player.play(resource);
-  const sourceTag = next.source === "soundcloud" ? " · via SoundCloud ⚠️" : "";
-  gs.textChannel?.send(`▶️ Tocando agora: **${next.title}** (pedido por ${next.by})${sourceTag} — <${next.url}>`).catch(() => {});
+  gs.textChannel?.send({ embeds: [nowPlayingEmbed(next)] }).catch(() => {});
+}
+
+const GOLD = 0xd4a017;
+const GRAY = 0x4f545c;
+const SOURCE_NAMES = { youtube: "YouTube", soundcloud: "SoundCloud", url: "Link direto" };
+
+const fmtDur = (s) =>
+  s ? `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}` : null;
+
+function nowPlayingEmbed(track) {
+  const fields = [
+    { name: "Pedido por", value: track.by, inline: true },
+    { name: "Fonte", value: SOURCE_NAMES[track.source] ?? "—", inline: true },
+  ];
+  const dur = fmtDur(track.duration);
+  if (dur) fields.push({ name: "Duração", value: dur, inline: true });
+  return {
+    author: { name: "Tocando agora" },
+    title: track.title,
+    url: track.url,
+    color: GOLD,
+    thumbnail: track.thumb ? { url: track.thumb } : undefined,
+    fields,
+    footer: { text: "Campeão" },
+  };
+}
+
+function queuedEmbed(track, position) {
+  return {
+    description: `**Na fila #${position}** · [${track.title}](${track.url}) · pedido por ${track.by}`,
+    color: GRAY,
+    thumbnail: track.thumb ? { url: track.thumb } : undefined,
+  };
 }
 
 function playBeep(gs) {
@@ -303,7 +358,7 @@ async function enqueue(gs, rawQuery, by) {
   const seq = ++gs.seqCounter;
   const track = await resolveTrack(query, source);
   if (!track) {
-    gs.textChannel?.send(`😔 Não achei nada pra "${query}"`).catch(() => {});
+    gs.textChannel?.send(`-# Nada encontrado para “${query}”`).catch(() => {});
     return;
   }
   track.by = by;
@@ -328,7 +383,7 @@ async function enqueue(gs, rawQuery, by) {
   if (gs.player.state.status === AudioPlayerStatus.Idle || !gs.current) {
     playNext(gs);
   } else {
-    gs.textChannel?.send(`➕ Na fila (#${gs.queue.indexOf(track) + 1}): **${track.title}**`).catch(() => {});
+    gs.textChannel?.send({ embeds: [queuedEmbed(track, gs.queue.indexOf(track) + 1)] }).catch(() => {});
   }
 }
 
@@ -490,6 +545,7 @@ function handleVoice(gs, userId, raw, startedAt) {
     return;
   }
 
+
   const restWords = rest.split(" ").filter((w) => !["ai", "ei", "vai", "ow", "o"].includes(w));
   const head = restWords[0] ?? "";
   const tail = restWords.slice(1).join(" ");
@@ -501,39 +557,39 @@ function handleVoice(gs, userId, raw, startedAt) {
       .trim();
     if (!query) return;
     unduck(gs);
-    gs.textChannel?.send(`🎤 ${mention} pediu: **${query}**`).catch(() => {});
+    gs.textChannel?.send(`-# ${mention} pediu “${query}” — buscando…`).catch(() => {});
     enqueue(gs, query, mention);
     return;
   }
   if (matchVerb(head, SKIP_VERBS)) {
     unduck(gs);
-    gs.textChannel?.send(`⏭️ ${mention} pulou a música`).catch(() => {});
+    gs.textChannel?.send(`-# Pulada por ${mention}`).catch(() => {});
     playNext(gs);
     return;
   }
   if (matchVerb(head, PAUSE_VERBS)) {
     gs.player.pause();
-    gs.textChannel?.send(`⏸️ ${mention} pausou a música`).catch(() => {});
+    gs.textChannel?.send(`-# Pausada por ${mention}`).catch(() => {});
     return;
   }
   if (matchVerb(head, RESUME_VERBS)) {
     unduck(gs);
     gs.player.unpause();
-    gs.textChannel?.send(`▶️ ${mention} despausou a música`).catch(() => {});
+    gs.textChannel?.send(`-# Retomada por ${mention}`).catch(() => {});
     return;
   }
   if (matchVerb(head, STOP_VERBS) || /^cala/.test(head)) {
     stopAll(gs);
-    gs.textChannel?.send(`⏹️ ${mention} parou a música`).catch(() => {});
+    gs.textChannel?.send(`-# Parada por ${mention} — fila limpa`).catch(() => {});
     return;
   }
   if (LEAVE_VERBS.includes(head)) {
-    gs.textChannel?.send(`👋 Falou, ${mention}!`).catch(() => {});
+    gs.textChannel?.send(`Até mais! Dispensado por ${mention}.`).catch(() => {});
     leave(gs);
     return;
   }
   if (wakeIdx !== -1) {
-    gs.textChannel?.send(`🤔 ${mention}, entendi "${rest}" mas não conheço esse comando`).catch(() => {});
+    gs.textChannel?.send(`-# Entendi “${rest}” — comando desconhecido`).catch(() => {});
   }
   console.log(`[wake] não entendi: "${rest}"`);
 }
@@ -591,15 +647,27 @@ client.on(Events.MessageCreate, async (m) => {
   if (["entra", "play", "p", "toca"].includes(command)) {
     const gs = joinFor(m.member, m.channel);
     if (!gs) {
-      m.reply("Entra num canal de voz primeiro! 🎧").catch(() => {});
+      m.reply("-# Entre num canal de voz primeiro").catch(() => {});
       return;
     }
     if (command === "entra") {
-      m.reply('Cheguei! 🏆 Fala "CAMPEÃO, TOCA <música>" ou usa `!play <música>`').catch(() => {});
+      m.reply({
+        embeds: [
+          {
+            author: { name: "Campeão na área" },
+            description: [
+              'Fale **"Campeão, toca <música>"** — ou use `!play <música>`.',
+              "Por voz também: **pula** · **pausa** · **continua** · **para** · **sai**",
+              'Fonte específica: *"…no YouTube"* ou *"…no SoundCloud"*. `!ajuda` para o resto.',
+            ].join("\n"),
+            color: GOLD,
+          },
+        ],
+      }).catch(() => {});
       return;
     }
     if (!query) {
-      m.reply("Fala qual música: `!play wonderwall oasis`").catch(() => {});
+      m.reply("-# Informe a música: `!play wonderwall oasis`").catch(() => {});
       return;
     }
     await enqueue(gs, query, `${m.author}`);
@@ -616,20 +684,27 @@ client.on(Events.MessageCreate, async (m) => {
   else if (["continua", "resume"].includes(command)) gs.player.unpause();
   else if (command === "fila") {
     const lines = [
-      gs.current ? `▶️ **${gs.current.title}**` : "Nada tocando",
-      ...gs.queue.map((t, i) => `${i + 1}. ${t.title}`),
+      gs.current ? `**Agora** · [${gs.current.title}](${gs.current.url})` : "Nada tocando.",
+      ...gs.queue.map((t, i) => `**${i + 1}** · ${t.title}`),
     ];
-    m.reply(lines.join("\n").slice(0, 1900)).catch(() => {});
+    m.reply({ embeds: [{ author: { name: "Fila" }, description: lines.join("\n").slice(0, 3900), color: GRAY }] }).catch(() => {});
   } else if (["sai", "sair"].includes(command)) leave(gs);
   else if (command === "ajuda") {
-    m.reply(
-      [
-        '**Por voz** (comigo no canal): "CAMPEÃO, TOCA <música>" — também: pula, pausa, continua, para, sai',
-        'Com música tocando, fala só "CAMPEÃO" que eu abaixo o som e te escuto por 2s',
-        'Fonte específica: "CAMPEÃO, TOCA <música> **no youtube**" (ou no soundcloud). Sem falar, o Deezer acha a faixa certa e eu busco o áudio',
-        "**Por texto**: `!entra` `!play <música>` `!pula` `!pausa` `!continua` `!para` `!fila` `!sai`",
-      ].join("\n"),
-    ).catch(() => {});
+    m.reply({
+      embeds: [
+        {
+          author: { name: "Como usar o Campeão" },
+          description: [
+            '**Por voz** (comigo no canal): *"Campeão, toca <música>"* — e também: pula, pausa, continua, para, sai.',
+            'Com música tocando, diga só *"Campeão"*: o som abaixa e eu escuto por 2s.',
+            '**Fonte específica**: *"…no YouTube"* ou *"…no SoundCloud"*. Sem indicar, o Deezer identifica a faixa oficial.',
+            "**Por texto**: `!entra` `!play` `!pula` `!pausa` `!continua` `!para` `!fila` `!sai`",
+          ].join("\n"),
+          color: GOLD,
+          footer: { text: "Campeão" },
+        },
+      ],
+    }).catch(() => {});
   }
 });
 
@@ -641,15 +716,19 @@ async function selfTestYoutube() {
   try {
     const { stdout, stderr } = await execFileP(
       "yt-dlp",
-      [...YTDLP_BASE, "-v", "--simulate", "--no-playlist", "-f", "bestaudio/best", "--print", "%(title)s", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
-      { timeout: 60000 },
+      [...YTDLP_BASE, "-v", "--simulate", "--no-playlist", "-f", "bestaudio/best", "--print", "%(title)s", "https://www.youtube.com/watch?v=SRXH9AbT280"],
+      { timeout: 90000 },
     );
-    const potActive = /bgutil|youtubepot|po_token/i.test(`${stderr}`) ? "POT ativo" : "POT NÃO detectado";
+    const potActive = /bgutil|youtubepot|po_token|potoken/i.test(`${stderr}`) ? "POT ativo" : "POT NÃO detectado";
     console.log(`[selftest] youtube OK (${potActive}): ${stdout.trim().slice(0, 60)}`);
   } catch (e) {
     const err = `${e.stderr || ""}${e.message || ""}`;
-    const potSeen = /bgutil|youtubepot/i.test(err) ? "plugin visível" : "plugin NÃO visível";
-    console.log(`[selftest] youtube FALHOU (${potSeen}): ${err.replace(/\s+/g, " ").slice(0, 400)}`);
+    const relevant = err
+      .split("\n")
+      .filter((l) => /pot|client|sign in|player|extracting|error/i.test(l))
+      .slice(0, 12)
+      .join(" § ");
+    console.log(`[selftest] youtube FALHOU: ${relevant.replace(/\s+/g, " ").slice(0, 800)}`);
   }
 }
 setTimeout(selfTestYoutube, 8000);
