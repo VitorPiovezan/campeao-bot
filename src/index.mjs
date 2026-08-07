@@ -1,6 +1,6 @@
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { Client, Events, GatewayIntentBits } from "discord.js";
@@ -34,9 +34,11 @@ const DUCK_VOLUME = 0.15;
 const DUCK_TIMEOUT_MS = 8000;
 const BEEP_FILE = "/tmp/beep.pcm";
 const CACHE_DIR = "/data/tracks";
+const INFO_DIR = "/tmp/info";
 const CACHE_MAX_FILES = 40;
-const STREAM_URL_TTL_MS = 90 * 60 * 1000;
+const INFO_TTL_MS = 3 * 60 * 60 * 1000;
 mkdirSync(CACHE_DIR, { recursive: true });
+mkdirSync(INFO_DIR, { recursive: true });
 
 const guilds = new Map();
 
@@ -142,9 +144,13 @@ async function deezerLookup(query) {
   }
 }
 
-async function runYtdlp(args) {
+async function runYtdlp(args, opts = {}) {
   try {
-    const { stdout } = await execFileP("yt-dlp", [...YTDLP_BASE, ...args], { timeout: 60000 });
+    const { stdout } = await execFileP("yt-dlp", [...YTDLP_BASE, ...args], {
+      timeout: 60000,
+      maxBuffer: 64 * 1024 * 1024,
+      ...opts,
+    });
     return stdout;
   } catch (e) {
     if (e.stdout?.trim()) return e.stdout;
@@ -152,7 +158,7 @@ async function runYtdlp(args) {
   }
 }
 
-const PRINT_FULL = ["--print", "%(title)s\t%(webpage_url)s\t%(channel)s\t%(duration)s\t%(thumbnail)s\t%(urls)s"];
+const PRINT_FULL = ["--print", "%(title)s\t%(webpage_url)s\t%(channel)s\t%(duration)s\t%(thumbnail)s"];
 const PRINT_FLAT = ["--print", "%(title)s\t%(url)s\t%(channel)s\t%(duration)s\t%(thumbnail)s"];
 
 function parseCandidates(stdout) {
@@ -161,14 +167,13 @@ function parseCandidates(stdout) {
     .split("\n")
     .filter(Boolean)
     .map((line) => {
-      const [title, url, channel, duration, thumbnail, streamUrl] = line.split("\t");
+      const [title, url, channel, duration, thumbnail] = line.split("\t");
       return {
         title,
         url,
         channel: channel === "NA" ? "" : (channel ?? ""),
         duration: Number.parseFloat(duration) || null,
         thumbnail: thumbnail && thumbnail !== "NA" ? thumbnail : null,
-        streamUrl: streamUrl?.startsWith("http") ? streamUrl : null,
       };
     })
     .filter((c) => c.url);
@@ -212,7 +217,7 @@ async function resolveTrack(query, source = "auto") {
     try {
       const c = parseCandidates(await runYtdlp(["--no-playlist", "-f", "bestaudio/best", ...PRINT_FULL, query]))[0];
       return c
-        ? { title: c.title, url: c.url, source: "url", thumb: c.thumbnail, duration: c.duration, streamUrl: c.streamUrl, resolvedAt: Date.now() }
+        ? { title: c.title, url: c.url, source: "url", thumb: c.thumbnail, duration: c.duration, resolvedAt: Date.now() }
         : null;
     } catch (e) {
       console.log(`[busca] url falhou: ${shortErr(e)}`);
@@ -238,15 +243,19 @@ async function resolveTrack(query, source = "auto") {
       console.log(`[busca] youtube: ${flat.map((c) => `${c.score.toFixed(1)} ${c.title?.slice(0, 45)}`).join(" | ")}`);
       for (const cand of flat.slice(0, 3)) {
         try {
-          const ok = parseCandidates(await runYtdlp(["--no-playlist", "-f", "bestaudio/best", ...PRINT_FULL, cand.url]))[0];
-          if (ok) {
+          const raw = await runYtdlp(["--no-playlist", "-f", "bestaudio/best", "-J", cand.url]);
+          const info = JSON.parse(raw.trim().split("\n").filter(Boolean)[0]);
+          if (info?.webpage_url) {
+            const infoFile = `${INFO_DIR}/${cacheKey(info.webpage_url)}.info.json`;
+            writeFileSync(infoFile, JSON.stringify(info));
+            pruneInfo();
             return {
-              title: forcedTitle ?? ok.title,
-              url: ok.url,
+              title: forcedTitle ?? info.title,
+              url: info.webpage_url,
               source: "youtube",
-              thumb: dzMeta?.cover ?? ok.thumbnail,
-              duration: dzMeta?.duration ?? ok.duration,
-              streamUrl: ok.streamUrl,
+              thumb: dzMeta?.cover ?? info.thumbnail,
+              duration: dzMeta?.duration ?? info.duration,
+              infoFile,
               resolvedAt: Date.now(),
             };
           }
@@ -274,7 +283,6 @@ async function resolveTrack(query, source = "auto") {
           source: "soundcloud",
           thumb: dzMeta?.cover ?? best.thumbnail,
           duration: dzMeta?.duration ?? best.duration,
-          streamUrl: best.streamUrl,
           resolvedAt: Date.now(),
         };
       }
@@ -325,6 +333,21 @@ function dropTrackFile(track) {
   }
 }
 
+function pruneInfo() {
+  for (const f of readdirSync(INFO_DIR)) {
+    try {
+      if (Date.now() - statSync(`${INFO_DIR}/${f}`).mtimeMs > INFO_TTL_MS) rmSync(`${INFO_DIR}/${f}`, { force: true });
+    } catch {}
+  }
+}
+
+function infoFresh(track) {
+  return track.infoFile && existsSync(track.infoFile) && Date.now() - (track.resolvedAt ?? 0) < INFO_TTL_MS;
+}
+
+const sourceArgs = (track) =>
+  infoFresh(track) ? ["--load-info-json", track.infoFile] : ["--no-playlist", track.url];
+
 function prefetch(track, tag = "preload") {
   const hit = cacheLookup(track.url);
   if (hit) {
@@ -335,13 +358,14 @@ function prefetch(track, tag = "preload") {
   if (track.prefetchProc) return;
   const key = cacheKey(track.url);
   const proc = spawn("yt-dlp", [
-    ...YTDLP_BASE, "-f", "bestaudio/best", "--no-playlist", "-q",
-    "-o", `${CACHE_DIR}/${key}.%(ext)s`, track.url,
+    ...YTDLP_BASE, "-f", "bestaudio/best", "-q",
+    "-o", `${CACHE_DIR}/${key}.%(ext)s`, ...sourceArgs(track),
   ]);
   track.prefetchProc = proc;
   proc.on("error", () => {});
   proc.on("exit", (code) => {
     track.prefetchProc = null;
+    if (code === null) return;
     const done = code === 0 ? cacheLookup(track.url) : null;
     if (done) {
       track.file = done;
@@ -355,7 +379,6 @@ function prefetch(track, tag = "preload") {
 }
 
 const FF_FAST = ["-analyzeduration", "0", "-probesize", "500K"];
-const FF_HTTP = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"];
 const FF_OUT = ["-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"];
 
 function startPlayback(gs, track, mode) {
@@ -365,21 +388,18 @@ function startPlayback(gs, track, mode) {
     console.log(`[player] tocando (cache): ${track.title}`);
     ff = spawn("ffmpeg", ["-loglevel", "quiet", ...FF_FAST, "-i", track.file, ...FF_OUT]);
     gs.procs = [ff];
-  } else if (mode === "direto") {
-    console.log(`[player] tocando (link direto): ${track.title}`);
-    ff = spawn("ffmpeg", ["-loglevel", "quiet", ...FF_HTTP, ...FF_FAST, "-i", track.streamUrl, ...FF_OUT]);
-    gs.procs = [ff];
-    prefetch(track, "cache");
   } else {
-    console.log(`[player] tocando (extração completa): ${track.title}`);
-    dropTrackFile(track);
-    const ytdlp = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", track.url]);
+    const reusing = mode === "info" && infoFresh(track);
+    console.log(`[player] tocando (${reusing ? "info reaproveitado" : "extração completa"}): ${track.title}`);
+    const args = reusing ? ["--load-info-json", track.infoFile] : ["--no-playlist", track.url];
+    const ytdlp = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "-q", "-o", "-", ...args]);
     ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", ...FF_OUT]);
     ytdlp.stderr.on("data", (d) => console.log(`[yt-dlp] ${d.toString().trim().slice(0, 200)}`));
     ytdlp.stdout.pipe(ff.stdin);
     ff.stdin.on("error", () => {});
     ytdlp.on("error", (e) => console.log("[yt-dlp] erro:", e.message));
     gs.procs = [ytdlp, ff];
+    prefetch(track, "cache");
   }
   ff.on("error", (e) => console.log("[ffmpeg] erro:", e.message));
   const resource = createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
@@ -390,15 +410,13 @@ function startPlayback(gs, track, mode) {
 function playNext(gs) {
   killProcs(gs);
   unduck(gs);
-  dropTrackFile(gs.current);
   const next = gs.queue.shift();
   gs.current = next ?? null;
   gs.currentResource = null;
   if (!next) return;
   const cached = next.file && existsSync(next.file) ? next.file : cacheLookup(next.url);
   if (cached) next.file = cached;
-  const streamFresh = next.streamUrl && Date.now() - (next.resolvedAt ?? 0) < STREAM_URL_TTL_MS;
-  startPlayback(gs, next, cached ? "cache" : streamFresh ? "direto" : "completa");
+  startPlayback(gs, next, cached ? "cache" : "info");
   gs.textChannel?.send({ embeds: [nowPlayingEmbed(next)] }).catch(() => {});
 }
 
@@ -734,7 +752,7 @@ function joinFor(member, channel) {
     if (cur && !cur.retried && (oldState.resource.playbackDuration ?? 0) < 1500) {
       cur.retried = true;
       cur.file = null;
-      cur.streamUrl = null;
+      cur.infoFile = null;
       console.log(`[player] áudio não iniciou, refazendo pela via longa: ${cur.title}`);
       startPlayback(gs, cur, "completa");
       return;
@@ -835,13 +853,22 @@ client.once(Events.ClientReady, () => {
 
 async function selfTestYoutube() {
   try {
-    const { stdout, stderr } = await execFileP(
-      "yt-dlp",
-      [...YTDLP_BASE, "-v", "--simulate", "--no-playlist", "-f", "bestaudio/best", "--print", "%(title)s", "https://www.youtube.com/watch?v=SRXH9AbT280"],
-      { timeout: 90000 },
-    );
-    const potActive = /bgutil|youtubepot|po_token|potoken/i.test(`${stderr}`) ? "POT ativo" : "POT NÃO detectado";
-    console.log(`[selftest] youtube OK (${potActive}): ${stdout.trim().slice(0, 60)}`);
+    const t0 = Date.now();
+    const raw = await runYtdlp(["--no-playlist", "-f", "bestaudio/best", "-J", "https://www.youtube.com/watch?v=SRXH9AbT280"], { timeout: 90000 });
+    const info = JSON.parse(raw.trim().split("\n").filter(Boolean)[0]);
+    const file = `${INFO_DIR}/selftest.info.json`;
+    writeFileSync(file, JSON.stringify(info));
+    const tExtract = Date.now() - t0;
+    const t1 = Date.now();
+    const bytes = await new Promise((resolve) => {
+      const p = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "-q", "-o", "-", "--load-info-json", file]);
+      let n = 0;
+      const done = (v) => { try { p.kill("SIGKILL"); } catch {} resolve(v); };
+      p.stdout.on("data", (d) => { n += d.length; if (n > 200000) done(n); });
+      p.on("exit", () => resolve(n));
+      setTimeout(() => done(n), 20000);
+    });
+    console.log(`[selftest] youtube OK: extração ${tExtract}ms | info reaproveitado ${Date.now() - t1}ms (${bytes} bytes) | ${info.title?.slice(0, 50)}`);
   } catch (e) {
     const err = `${e.stderr || ""}${e.message || ""}`;
     const relevant = err
