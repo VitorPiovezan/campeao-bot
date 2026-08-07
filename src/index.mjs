@@ -78,6 +78,7 @@ function getState(guildId) {
       vetoed: new Set(),
       lastActivity: Date.now(),
       guild: null,
+      nowPlayingMessage: null,
     });
   }
   return guilds.get(guildId);
@@ -431,7 +432,7 @@ function playNext(gs) {
   const cached = next.file && existsSync(next.file) ? next.file : cacheLookup(next.url);
   if (cached) next.file = cached;
   startPlayback(gs, next, cached ? "cache" : "info");
-  gs.textChannel?.send({ embeds: [nowPlayingEmbed(next)] }).catch(() => {});
+  sendNowPlaying(gs, next);
   if (gs.radio && gs.queue.length === 0) radioFill(gs, false);
 }
 
@@ -506,6 +507,53 @@ function nowPlayingEmbed(track) {
     fields,
     footer: { text: "Campeão" },
   };
+}
+
+const BTN = { PRIMARY: 1, SECONDARY: 2, DANGER: 4 };
+
+function controlRows(gs) {
+  const paused = gs.player?.state?.status === AudioPlayerStatus.Paused;
+  return [
+    {
+      type: 1,
+      components: [
+        { type: 2, style: BTN.SECONDARY, custom_id: "cmp:pause", label: paused ? "Retomar" : "Pausar" },
+        { type: 2, style: BTN.SECONDARY, custom_id: "cmp:skip", label: "Pular" },
+        { type: 2, style: BTN.SECONDARY, custom_id: "cmp:veto", label: "Não curti" },
+        { type: 2, style: BTN.DANGER, custom_id: "cmp:stop", label: "Parar" },
+      ],
+    },
+    {
+      type: 1,
+      components: [
+        { type: 2, style: gs.radio ? BTN.PRIMARY : BTN.SECONDARY, custom_id: "cmp:radio", label: gs.radio ? "Rádio ligado" : "Ligar rádio" },
+        { type: 2, style: BTN.SECONDARY, custom_id: "cmp:queue", label: "Ver fila" },
+      ],
+    },
+  ];
+}
+
+async function sendNowPlaying(gs, track) {
+  const previous = gs.nowPlayingMessage;
+  gs.nowPlayingMessage = null;
+  if (previous) previous.edit({ components: [] }).catch(() => {});
+  try {
+    gs.nowPlayingMessage = await gs.textChannel?.send({ embeds: [nowPlayingEmbed(track)], components: controlRows(gs) });
+  } catch (e) {
+    console.log("[discord] falha ao enviar card:", e.message);
+  }
+}
+
+function refreshControls(gs) {
+  gs.nowPlayingMessage?.edit({ components: controlRows(gs) }).catch(() => {});
+}
+
+function queueText(gs) {
+  const lines = [
+    gs.current ? `**Agora** · [${gs.current.title}](${gs.current.url})` : "Nada tocando.",
+    ...gs.queue.map((t, i) => `**${i + 1}** · ${t.title}${t.radio ? " · rádio" : ""}`),
+  ];
+  return lines.join("\n").slice(0, 1900);
 }
 
 function queuedEmbed(track, position) {
@@ -587,6 +635,8 @@ function stopAll(gs) {
   killProcs(gs);
   unduck(gs);
   gs.player.stop();
+  gs.nowPlayingMessage?.edit({ components: [] }).catch(() => {});
+  gs.nowPlayingMessage = null;
 }
 
 function setRadio(gs, on, by) {
@@ -647,6 +697,8 @@ function checkIdle(gs) {
 
 function teardown(gs) {
   if (gs.idleTimer) clearInterval(gs.idleTimer);
+  gs.nowPlayingMessage?.edit({ components: [] }).catch(() => {});
+  gs.nowPlayingMessage = null;
   if (guilds.get(gs.guildId) === gs) guilds.delete(gs.guildId);
   gs.dead = true;
   try {
@@ -937,12 +989,14 @@ function handleVoice(gs, userId, raw, startedAt) {
   if (matchVerb(head, PAUSE_VERBS)) {
     gs.player.pause();
     gs.textChannel?.send(`-# Pausada por ${mention}`).catch(() => {});
+    refreshControls(gs);
     return;
   }
   if (matchVerb(head, RESUME_VERBS)) {
     unduck(gs);
     gs.player.unpause();
     gs.textChannel?.send(`-# Retomada por ${mention}`).catch(() => {});
+    refreshControls(gs);
     return;
   }
   if (matchVerb(head, STOP_VERBS) || /^cala/.test(head)) {
@@ -1070,11 +1124,7 @@ client.on(Events.MessageCreate, async (m) => {
   else if (command === "pausa") gs.player.pause();
   else if (["continua", "resume"].includes(command)) gs.player.unpause();
   else if (command === "fila") {
-    const lines = [
-      gs.current ? `**Agora** · [${gs.current.title}](${gs.current.url})` : "Nada tocando.",
-      ...gs.queue.map((t, i) => `**${i + 1}** · ${t.title}`),
-    ];
-    m.reply({ embeds: [{ author: { name: "Fila" }, description: lines.join("\n").slice(0, 3900), color: GRAY }] }).catch(() => {});
+    m.reply({ embeds: [{ author: { name: "Fila" }, description: queueText(gs), color: GRAY }] }).catch(() => {});
   } else if (["sai", "sair"].includes(command)) leave(gs);
   else if (command === "ajuda") {
     m.reply({
@@ -1094,6 +1144,50 @@ client.on(Events.MessageCreate, async (m) => {
         },
       ],
     }).catch(() => {});
+  }
+});
+
+client.on(Events.InteractionCreate, async (i) => {
+  if (!i.isButton() || !i.customId.startsWith("cmp:")) return;
+  const gs = guilds.get(i.guildId);
+  if (!gs) {
+    i.reply({ content: "-# Não estou mais tocando nada.", flags: 64 }).catch(() => {});
+    return;
+  }
+  const action = i.customId.slice(4);
+  gs.lastActivity = Date.now();
+  const who = `<@${i.user.id}>`;
+
+  if (action === "queue") {
+    i.reply({ content: queueText(gs), flags: 64 }).catch(() => {});
+    return;
+  }
+  await i.deferUpdate().catch(() => {});
+
+  if (action === "pause") {
+    const paused = gs.player.state.status === AudioPlayerStatus.Paused;
+    if (paused) {
+      unduck(gs);
+      gs.player.unpause();
+      gs.textChannel?.send(`-# Retomada por ${who}`).catch(() => {});
+    } else {
+      gs.player.pause();
+      gs.textChannel?.send(`-# Pausada por ${who}`).catch(() => {});
+    }
+    refreshControls(gs);
+  } else if (action === "skip") {
+    gs.textChannel?.send(`-# Pulada por ${who}`).catch(() => {});
+    playNext(gs);
+  } else if (action === "veto") {
+    vetoCurrent(gs, who);
+  } else if (action === "stop") {
+    stopAll(gs);
+    gs.nowPlayingMessage?.edit({ components: [] }).catch(() => {});
+    gs.nowPlayingMessage = null;
+    gs.textChannel?.send(`-# Parada por ${who} — fila limpa`).catch(() => {});
+  } else if (action === "radio") {
+    setRadio(gs, !gs.radio, who);
+    refreshControls(gs);
   }
 });
 
