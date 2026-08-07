@@ -766,6 +766,65 @@ async function transcribe(pcm, priority = false) {
   }
 }
 
+const GATE_SECONDS = 2.5;
+const GATE_MAX_CONCURRENT = 2;
+let gatePending = 0;
+const gateStats = { pass: 0, block: 0, busy: 0 };
+
+const GATE_STOP = new Set([
+  "campo", "campos", "campanha", "compra", "comprar", "comprei", "compras", "compro",
+  "compilei", "compilar", "compila", "computador", "companhia", "comparar", "compara",
+  "completo", "completa", "completou", "complicado", "compromisso", "competir",
+  "competencia", "comportamento", "comprido", "compreendi", "compreender", "compensa",
+  "componente", "composto", "comprovar", "campeonato",
+]);
+
+function gateHasWake(text) {
+  const t = norm(text ?? "");
+  if (!t) return false;
+  return t.split(" ").some((w) => {
+    if (GATE_STOP.has(w)) return false;
+    if (/peao|piao/.test(w)) return true;
+    if (/^(c[ao]mp|kamp)/.test(w)) return true;
+    return w.length >= 5 && editDistance(w, "campeao") <= 3;
+  });
+}
+
+async function gateWake(pcm16, who) {
+  if (gatePending >= GATE_MAX_CONCURRENT) {
+    gateStats.busy++;
+    return false;
+  }
+  gatePending++;
+  try {
+    const head = pcm16.subarray(0, Math.min(pcm16.length, Math.round(16000 * 2 * GATE_SECONDS)));
+    const text = await localTranscribe(head);
+    const ok = gateHasWake(text);
+    if (ok) {
+      gateStats.pass++;
+      console.log(`[gate] ${who}: passou ("${(text ?? "").trim().slice(0, 40)}")`);
+    } else {
+      gateStats.block++;
+    }
+    return ok;
+  } catch (e) {
+    console.log("[gate] erro, deixando passar:", e.message);
+    return true;
+  } finally {
+    gatePending--;
+  }
+}
+
+setInterval(() => {
+  const { pass, block, busy } = gateStats;
+  if (pass + block + busy > 0) {
+    console.log(`[gate] 5min: ${pass} p/ groq, ${block} barradas, ${busy} descartadas (economia ${Math.round((100 * (block + busy)) / (pass + block + busy))}%)`);
+    gateStats.pass = 0;
+    gateStats.block = 0;
+    gateStats.busy = 0;
+  }
+}, 5 * 60 * 1000);
+
 function captureUtterance(gs, userId) {
   if (gs.dead || guilds.get(gs.guildId) !== gs) return;
   if (gs.listening.has(userId)) return;
@@ -799,7 +858,9 @@ function captureUtterance(gs, userId) {
     }
     const attentive = (gs.attention.get(userId) ?? 0) > startedAt;
     if (attentive) playBeep(gs);
-    const text = await transcribe(to16kMono(pcm), attentive);
+    const pcm16 = to16kMono(pcm);
+    if (!attentive && GROQ_KEY && !(await gateWake(pcm16, user?.username ?? userId))) return;
+    const text = await transcribe(pcm16, attentive);
     console.log(`[stt] ${user?.username ?? userId}: "${text}"`);
     if (text) handleVoice(gs, userId, text, startedAt);
   });
