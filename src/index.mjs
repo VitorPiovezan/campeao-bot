@@ -72,6 +72,12 @@ function getState(guildId) {
       recentEnqueued: new Map(),
       recentCommands: new Map(),
       dead: false,
+      radio: false,
+      radioFilling: false,
+      played: new Set(),
+      vetoed: new Set(),
+      lastActivity: Date.now(),
+      guild: null,
     });
   }
   return guilds.get(guildId);
@@ -416,11 +422,65 @@ function playNext(gs) {
   const next = gs.queue.shift();
   gs.current = next ?? null;
   gs.currentResource = null;
-  if (!next) return;
+  if (!next) {
+    if (gs.radio) radioFill(gs, true);
+    return;
+  }
+  gs.played.add(next.url);
+  gs.lastActivity = Date.now();
   const cached = next.file && existsSync(next.file) ? next.file : cacheLookup(next.url);
   if (cached) next.file = cached;
   startPlayback(gs, next, cached ? "cache" : "info");
   gs.textChannel?.send({ embeds: [nowPlayingEmbed(next)] }).catch(() => {});
+  if (gs.radio && gs.queue.length === 0) radioFill(gs, false);
+}
+
+const videoIdOf = (url) => url?.match(/[?&]v=([\w-]{11})/)?.[1] ?? null;
+
+function radioSeed(gs) {
+  const url = [gs.current?.url, ...[...gs.played].reverse()].filter(Boolean).find(videoIdOf);
+  return url ? { url } : null;
+}
+
+async function radioFill(gs, playNow) {
+  if (!gs.radio || gs.radioFilling || gs.dead) return;
+  const seed = radioSeed(gs);
+  if (!seed) return;
+  gs.radioFilling = true;
+  try {
+    const id = videoIdOf(seed.url);
+    const mix = parseCandidates(
+      await runYtdlp(["-i", "--flat-playlist", "--playlist-end", "30", ...PRINT_FLAT, `https://www.youtube.com/watch?v=${id}&list=RD${id}`]),
+    );
+    const pick = mix.find((c) => {
+      const t = norm(c.title ?? "");
+      if (!c.url || gs.played.has(c.url) || gs.queue.some((q) => q.url === c.url)) return false;
+      if ([...gs.vetoed].some((v) => t.includes(v))) return false;
+      return !REMIX_WORDS.some((w) => t.includes(w));
+    });
+    if (!pick) {
+      console.log("[radio] nenhuma sugestão nova no mix");
+      return;
+    }
+    console.log(`[radio] sugestão: ${pick.title}`);
+    const track = {
+      title: pick.title,
+      url: pick.url,
+      source: "youtube",
+      thumb: pick.thumbnail,
+      duration: pick.duration,
+      by: "Rádio",
+      radio: true,
+      seq: ++gs.seqCounter,
+    };
+    gs.queue.push(track);
+    prefetch(track, "radio");
+    if (playNow && !gs.current) playNext(gs);
+  } catch (e) {
+    console.log(`[radio] falhou: ${shortErr(e)}`);
+  } finally {
+    gs.radioFilling = false;
+  }
 }
 
 const GOLD = 0xd4a017;
@@ -432,16 +492,16 @@ const fmtDur = (s) =>
 
 function nowPlayingEmbed(track) {
   const fields = [
-    { name: "Pedido por", value: track.by, inline: true },
+    { name: track.radio ? "Sugestão do rádio" : "Pedido por", value: track.by, inline: true },
     { name: "Fonte", value: SOURCE_NAMES[track.source] ?? "—", inline: true },
   ];
   const dur = fmtDur(track.duration);
   if (dur) fields.push({ name: "Duração", value: dur, inline: true });
   return {
-    author: { name: "Tocando agora" },
+    author: { name: track.radio ? "Tocando agora · Rádio" : "Tocando agora" },
     title: track.title,
     url: track.url,
-    color: GOLD,
+    color: track.radio ? 0x5865f2 : GOLD,
     thumbnail: track.thumb ? { url: track.thumb } : undefined,
     fields,
     footer: { text: "Campeão" },
@@ -529,7 +589,64 @@ function stopAll(gs) {
   gs.player.stop();
 }
 
+function setRadio(gs, on, by) {
+  gs.radio = on;
+  gs.lastActivity = Date.now();
+  if (on) {
+    gs.textChannel?.send(`-# Rádio ligado por ${by} — quando a fila acabar eu sigo tocando parecidas`).catch(() => {});
+    if (!gs.current) radioFill(gs, true);
+    else if (gs.queue.length === 0) radioFill(gs, false);
+  } else {
+    gs.queue = gs.queue.filter((t) => !t.radio);
+    gs.textChannel?.send(`-# Rádio desligado por ${by}`).catch(() => {});
+  }
+}
+
+function vetoCurrent(gs, by) {
+  const cur = gs.current;
+  if (!cur) return;
+  const key = norm(cur.title).split(" ").slice(0, 3).join(" ");
+  if (key) gs.vetoed.add(key);
+  gs.textChannel?.send(`-# ${by} vetou **${cur.title}** — não repito nesta sessão`).catch(() => {});
+  playNext(gs);
+}
+
+function humansInChannel(gs) {
+  try {
+    const chId = gs.connection?.joinConfig?.channelId;
+    const ch = gs.guild?.channels?.cache?.get(chId);
+    return ch ? ch.members.filter((m) => !m.user.bot).size : 1;
+  } catch {
+    return 1;
+  }
+}
+
+const IDLE_MS = 5 * 60 * 1000;
+const EMPTY_MS = 60 * 1000;
+
+function checkIdle(gs) {
+  if (gs.dead) return;
+  const alone = humansInChannel(gs) === 0;
+  if (alone) {
+    gs.emptySince ??= Date.now();
+    if (Date.now() - gs.emptySince > EMPTY_MS) {
+      gs.textChannel?.send("-# Canal vazio, saindo").catch(() => {});
+      console.log("[idle] canal vazio, saindo");
+      leave(gs);
+    }
+    return;
+  }
+  gs.emptySince = null;
+  const idle = !gs.current && Date.now() - gs.lastActivity > IDLE_MS;
+  if (idle) {
+    gs.textChannel?.send("-# 5 minutos sem música e sem comando, vou nessa. Chame com `!entra`").catch(() => {});
+    console.log("[idle] ocioso 5min, saindo");
+    leave(gs);
+  }
+}
+
 function teardown(gs) {
+  if (gs.idleTimer) clearInterval(gs.idleTimer);
   if (guilds.get(gs.guildId) === gs) guilds.delete(gs.guildId);
   gs.dead = true;
   try {
@@ -700,6 +817,7 @@ function handleVoice(gs, userId, raw, startedAt) {
     return;
   }
   gs.attention.delete(userId);
+  gs.lastActivity = Date.now();
   console.log(`[wake] comando: "${rest}"`);
   const mention = `<@${userId}>`;
 
@@ -713,6 +831,17 @@ function handleVoice(gs, userId, raw, startedAt) {
   const restWords = rest.split(" ").filter((w) => !["ai", "ei", "vai", "ow", "o"].includes(w));
   const head = restWords[0] ?? "";
   const tail = restWords.slice(1).join(" ");
+  const mentionsRadio = restWords.length <= 2 && restWords.some((w) => matchVerb(w, ["radio"]));
+
+  if (mentionsRadio) {
+    const off = ["para", "parar", "desliga", "desligar", "tira", "encerra", "cancela"].some((v) => matchVerb(head, [v]));
+    setRadio(gs, !off, mention);
+    return;
+  }
+  if (/^(essa|esta|essa nao|nao gostei|tira essa|veta|odeio)/.test(rest) && /(nao|gostei|tira|veta|odeio)/.test(rest)) {
+    vetoCurrent(gs, mention);
+    return;
+  }
 
   if (matchVerb(head, PLAY_VERBS)) {
     const query = tail
@@ -804,6 +933,9 @@ function joinFor(member, channel) {
     playNext(gs);
   });
   gs.connection.receiver.speaking.on("start", (userId) => captureUtterance(gs, userId));
+  gs.guild = member.guild;
+  gs.lastActivity = Date.now();
+  gs.idleTimer = setInterval(() => checkIdle(gs), 30000);
   console.log(`[voz] entrei em "${voice.name}" (${member.guild.name})`);
   return gs;
 }
@@ -856,8 +988,10 @@ client.on(Events.MessageCreate, async (m) => {
   const gs = guilds.get(m.guild.id);
   if (!gs) return;
   gs.textChannel = m.channel;
+  gs.lastActivity = Date.now();
 
-  if (["pula", "skip", "proxima"].includes(command)) playNext(gs);
+  if (command === "radio") setRadio(gs, !gs.radio, `${m.author}`);
+  else if (["pula", "skip", "proxima"].includes(command)) playNext(gs);
   else if (["para", "stop"].includes(command)) stopAll(gs);
   else if (command === "pausa") gs.player.pause();
   else if (["continua", "resume"].includes(command)) gs.player.unpause();
@@ -877,7 +1011,9 @@ client.on(Events.MessageCreate, async (m) => {
             '**Por voz** (comigo no canal): *"Campeão, toca <música>"* — e também: pula, pausa, continua, para, sai.',
             'Com música tocando, diga só *"Campeão"*: o som abaixa e eu escuto por 2s.',
             '**Fonte específica**: *"…no YouTube"* ou *"…no SoundCloud"*. Sem indicar, o Deezer identifica a faixa oficial.',
-            "**Por texto**: `!entra` `!play` `!pula` `!pausa` `!continua` `!para` `!fila` `!sai`",
+            '**Rádio**: *"Campeão, liga o rádio"* — quando a fila acaba, sigo tocando parecidas. *"Campeão, essa não"* veta a atual.',
+            "Saio sozinho após 5 min sem música e sem comando, ou 1 min com o canal vazio.",
+            "**Por texto**: `!entra` `!play` `!pula` `!pausa` `!continua` `!para` `!fila` `!radio` `!sai`",
           ].join("\n"),
           color: GOLD,
           footer: { text: "Campeão" },
