@@ -879,10 +879,10 @@ async function selfTestYoutube() {
       });
     console.log(`[selftest] extração ${tExtract}ms | formato ${info.format_id} ${info.ext} ${Math.round((info.filesize ?? info.filesize_approx ?? 0) / 1024)}KB proto=${info.protocol}`);
     const variants = [
-      [["--load-info-json", file], "info puro"],
-      [["--load-info-json", file, "--http-chunk-size", "1M"], "chunk 1M"],
-      [["--load-info-json", file, "--http-chunk-size", "300K"], "chunk 300K"],
-      [["--load-info-json", file, "-N", "4"], "N=4"],
+      [["--load-info-json", file, "--http-chunk-size", "1M"], "chunk 1M (1º)"],
+      [["--load-info-json", file], "info puro (2º)"],
+      [["--load-info-json", file, "--http-chunk-size", "1M"], "chunk 1M (3º)"],
+      [["--load-info-json", file], "info puro (4º)"],
     ];
     for (const [args, label] of variants) {
       console.log(`[selftest] ${await measure(args, label)}`);
