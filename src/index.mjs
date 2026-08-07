@@ -879,14 +879,19 @@ async function selfTestYoutube() {
       });
     console.log(`[selftest] extração ${tExtract}ms | formato ${info.format_id} ${info.ext} ${Math.round((info.filesize ?? info.filesize_approx ?? 0) / 1024)}KB proto=${info.protocol}`);
     const variants = [
-      [["--load-info-json", file, "--http-chunk-size", "1M"], "chunk 1M (1º)"],
-      [["--load-info-json", file], "info puro (2º)"],
-      [["--load-info-json", file, "--http-chunk-size", "1M"], "chunk 1M (3º)"],
-      [["--load-info-json", file], "info puro (4º)"],
+      [["--load-info-json", file], "vídeo A 1ª vez"],
+      [["--load-info-json", file], "vídeo A 2ª vez"],
     ];
     for (const [args, label] of variants) {
       console.log(`[selftest] ${await measure(args, label)}`);
     }
+    const t2 = Date.now();
+    const rawB = await runYtdlp(["--no-playlist", "-f", "bestaudio/best", "-J", "https://www.youtube.com/watch?v=bx1Bh8ZvH84"], { timeout: 90000 });
+    const infoB = JSON.parse(rawB.trim().split("\n").filter(Boolean)[0]);
+    const fileB = `${INFO_DIR}/selftest-b.info.json`;
+    writeFileSync(fileB, JSON.stringify(infoB));
+    console.log(`[selftest] vídeo B extração ${Date.now() - t2}ms`);
+    console.log(`[selftest] ${await measure(["--load-info-json", fileB], "vídeo B (novo, pós-aquecimento)")}`);
   } catch (e) {
     const err = `${e.stderr || ""}${e.message || ""}`;
     const relevant = err
