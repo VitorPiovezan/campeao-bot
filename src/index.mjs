@@ -878,20 +878,36 @@ async function selfTestYoutube() {
         setTimeout(done, 25000);
       });
     console.log(`[selftest] extração ${tExtract}ms | formato ${info.format_id} ${info.ext} ${Math.round((info.filesize ?? info.filesize_approx ?? 0) / 1024)}KB proto=${info.protocol}`);
-    const variants = [
-      [["--load-info-json", file], "vídeo A 1ª vez"],
-      [["--load-info-json", file], "vídeo A 2ª vez"],
+    console.log(`[selftest] ${await measure(["--load-info-json", file], "aquecimento")}`);
+    const base = ["--js-runtimes", "node", "--remote-components", "ejs:github", ...(hasCookies ? ["--cookies", COOKIES_FILE] : [])];
+    const withPot = POT_URL ? ["--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_URL}`] : [];
+    const trials = [
+      ["padrao (cookies+POT)", [...base, ...withPot], "kJQP7kiw5Fk"],
+      ["so cookies (sem POT)", base, "9bZkp7q19f0"],
+      ["client tv", [...base, ...withPot, "--extractor-args", "youtube:player_client=tv"], "fJ9rUzIMcZQ"],
     ];
-    for (const [args, label] of variants) {
-      console.log(`[selftest] ${await measure(args, label)}`);
+    for (const [label, argv, vid] of trials) {
+      try {
+        const te = Date.now();
+        const { stdout } = await execFileP("yt-dlp", [...argv, "--no-playlist", "-f", "bestaudio/best", "-J", `https://www.youtube.com/watch?v=${vid}`], { timeout: 90000, maxBuffer: 64 * 1024 * 1024 });
+        const inf = JSON.parse(stdout.trim().split("\n").filter(Boolean)[0]);
+        const fp = `${INFO_DIR}/trial-${vid}.json`;
+        writeFileSync(fp, JSON.stringify(inf));
+        const extractMs = Date.now() - te;
+        const td = Date.now();
+        const r = await new Promise((resolve) => {
+          const p = spawn("yt-dlp", [...argv, "-f", "bestaudio/best", "-q", "-o", "-", "--load-info-json", fp]);
+          let n = 0, ttfb = null;
+          const fin = () => { try { p.kill("SIGKILL"); } catch {} resolve(`1º byte ${ttfb ?? "—"}ms`); };
+          p.stdout.on("data", (d) => { if (ttfb === null) ttfb = Date.now() - td; n += d.length; if (n > 300000) fin(); });
+          p.on("exit", fin);
+          setTimeout(fin, 30000);
+        });
+        console.log(`[trial] ${label}: extração ${extractMs}ms | ${r}`);
+      } catch (e) {
+        console.log(`[trial] ${label}: FALHOU ${shortErr(e)}`);
+      }
     }
-    const t2 = Date.now();
-    const rawB = await runYtdlp(["--no-playlist", "-f", "bestaudio/best", "-J", "https://www.youtube.com/watch?v=bx1Bh8ZvH84"], { timeout: 90000 });
-    const infoB = JSON.parse(rawB.trim().split("\n").filter(Boolean)[0]);
-    const fileB = `${INFO_DIR}/selftest-b.info.json`;
-    writeFileSync(fileB, JSON.stringify(infoB));
-    console.log(`[selftest] vídeo B extração ${Date.now() - t2}ms`);
-    console.log(`[selftest] ${await measure(["--load-info-json", fileB], "vídeo B (novo, pós-aquecimento)")}`);
   } catch (e) {
     const err = `${e.stderr || ""}${e.message || ""}`;
     const relevant = err
