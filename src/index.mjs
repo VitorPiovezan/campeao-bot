@@ -18,9 +18,11 @@ const execFileP = promisify(execFile);
 const TOKEN = process.env.DISCORD_TOKEN;
 const POT_URL = process.env.POT_PROVIDER_URL;
 const GROQ_KEY = process.env.GROQ_API_KEY;
+const COOKIES_FILE = "/data/cookies.txt";
+const hasCookies = existsSync(COOKIES_FILE);
 const YTDLP_BASE = [
   "--js-runtimes", "node",
-  "--extractor-args", "youtube:player_client=mweb,web",
+  ...(hasCookies ? ["--cookies", COOKIES_FILE] : []),
   ...(POT_URL ? ["--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_URL}`] : []),
 ];
 const STT_URL = "http://127.0.0.1:5005/";
