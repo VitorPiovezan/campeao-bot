@@ -851,75 +851,28 @@ client.once(Events.ClientReady, () => {
   console.log(`Campeão online como ${client.user.tag}`);
 });
 
-async function selfTestYoutube() {
+async function warmupYoutube() {
   try {
     const t0 = Date.now();
     const raw = await runYtdlp(["--no-playlist", "-f", "bestaudio/best", "-J", "https://www.youtube.com/watch?v=SRXH9AbT280"], { timeout: 90000 });
     const info = JSON.parse(raw.trim().split("\n").filter(Boolean)[0]);
-    const file = `${INFO_DIR}/selftest.info.json`;
+    const file = `${INFO_DIR}/warmup.info.json`;
     writeFileSync(file, JSON.stringify(info));
-    const tExtract = Date.now() - t0;
-    const measure = (args, label) =>
-      new Promise((resolve) => {
-        const t = Date.now();
-        const p = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "-q", "-o", "-", ...args]);
-        let n = 0;
-        let ttfb = null;
-        const done = () => {
-          try { p.kill("SIGKILL"); } catch {}
-          resolve(`${label}: 1º byte ${ttfb ?? "—"}ms, ${Math.round(n / 1024)}KB em ${Date.now() - t}ms`);
-        };
-        p.stdout.on("data", (d) => {
-          if (ttfb === null) ttfb = Date.now() - t;
-          n += d.length;
-          if (n > 400000) done();
-        });
-        p.on("exit", done);
-        setTimeout(done, 25000);
-      });
-    console.log(`[selftest] extração ${tExtract}ms | formato ${info.format_id} ${info.ext} ${Math.round((info.filesize ?? info.filesize_approx ?? 0) / 1024)}KB proto=${info.protocol}`);
-    console.log(`[selftest] ${await measure(["--load-info-json", file], "aquecimento")}`);
-    const base = ["--js-runtimes", "node", "--remote-components", "ejs:github", ...(hasCookies ? ["--cookies", COOKIES_FILE] : [])];
-    const withPot = POT_URL ? ["--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_URL}`] : [];
-    const full = [...base, ...withPot];
-    const trials = [
-      ["client web", [...full, "--extractor-args", "youtube:player_client=web"], "hT_nvWreIhg", []],
-      ["client mweb", [...full, "--extractor-args", "youtube:player_client=mweb"], "60ItHLz5WEA", []],
-      ["client web_safari", [...full, "--extractor-args", "youtube:player_client=web_safari"], "ktvTqknDobU", []],
-    ];
-    for (const [label, argv, vid, dlFlags] of trials) {
-      try {
-        const te = Date.now();
-        const { stdout } = await execFileP("yt-dlp", [...argv, "--no-playlist", "-f", "bestaudio/best", "-J", `https://www.youtube.com/watch?v=${vid}`], { timeout: 90000, maxBuffer: 64 * 1024 * 1024 });
-        const inf = JSON.parse(stdout.trim().split("\n").filter(Boolean)[0]);
-        const fp = `${INFO_DIR}/trial-${vid}.json`;
-        writeFileSync(fp, JSON.stringify(inf));
-        const extractMs = Date.now() - te;
-        const td = Date.now();
-        const r = await new Promise((resolve) => {
-          const p = spawn("yt-dlp", [...argv, ...dlFlags, "-f", "bestaudio/best", "-q", "-o", "-", "--load-info-json", fp]);
-          let n = 0, ttfb = null;
-          const fin = () => { try { p.kill("SIGKILL"); } catch {} resolve(`1º byte ${ttfb ?? "—"}ms`); };
-          p.stdout.on("data", (d) => { if (ttfb === null) ttfb = Date.now() - td; n += d.length; if (n > 300000) fin(); });
-          p.on("exit", fin);
-          setTimeout(fin, 30000);
-        });
-        console.log(`[trial] ${label}: extração ${extractMs}ms | ${r}`);
-      } catch (e) {
-        console.log(`[trial] ${label}: FALHOU ${shortErr(e)}`);
-      }
-    }
+    const tDl = Date.now();
+    const ttfb = await new Promise((resolve) => {
+      const p = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "-q", "-o", "-", "--load-info-json", file]);
+      const fin = (v) => { try { p.kill("SIGKILL"); } catch {} resolve(v); };
+      p.stdout.once("data", () => fin(Date.now() - tDl));
+      p.on("exit", () => resolve(null));
+      setTimeout(() => fin(null), 30000);
+    });
+    console.log(`[aquecimento] youtube ok — extração ${Date.now() - t0 - (Date.now() - tDl)}ms, 1º byte ${ttfb}ms`);
   } catch (e) {
-    const err = `${e.stderr || ""}${e.message || ""}`;
-    const relevant = err
-      .split("\n")
-      .filter((l) => /pot|sign in|player|error|warning/i.test(l))
-      .slice(-20)
-      .join(" § ");
-    console.log(`[selftest] youtube FALHOU: ${relevant.replace(/\s+/g, " ").slice(0, 2500)}`);
+    console.log(`[aquecimento] youtube FALHOU: ${shortErr(e)}`);
   }
 }
-setTimeout(selfTestYoutube, 8000);
+setTimeout(warmupYoutube, 8000);
+setInterval(warmupYoutube, 4 * 60 * 60 * 1000);
 
 try {
   ensureBeep();
