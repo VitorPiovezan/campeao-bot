@@ -883,9 +883,9 @@ async function selfTestYoutube() {
     const withPot = POT_URL ? ["--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_URL}`] : [];
     const full = [...base, ...withPot];
     const trials = [
-      ["baseline", full, "JGwWNGJdvx8", []],
-      ["chunk 100K", full, "RgKAFK5djSk", ["--http-chunk-size", "100K"]],
-      ["buffer 16K", full, "OPf0YbXqDm0", ["--buffer-size", "16K", "--no-resize-buffer"]],
+      ["ipv4 forcado", [...full, "-4"], "L_jWHffIx5E", ["-4"]],
+      ["ipv4 forcado 2", [...full, "-4"], "CevxZvSJLk8", ["-4"]],
+      ["baseline comparativo", full, "YQHsXMglC9A", []],
     ];
     for (const [label, argv, vid, dlFlags] of trials) {
       try {
