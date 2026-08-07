@@ -1,5 +1,5 @@
 import { spawn, execFile, execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { Client, Events, GatewayIntentBits } from "discord.js";
@@ -32,6 +32,8 @@ const ATTENTION_MS = 2500;
 const DUCK_VOLUME = 0.15;
 const DUCK_TIMEOUT_MS = 8000;
 const BEEP_FILE = "/tmp/beep.pcm";
+const TRACKS_DIR = "/tmp/tracks";
+mkdirSync(TRACKS_DIR, { recursive: true });
 
 const guilds = new Map();
 
@@ -273,22 +275,61 @@ async function resolveTrack(query, source = "auto") {
   return null;
 }
 
+function dropTrackFile(track) {
+  if (track?.prefetchProc) {
+    try { track.prefetchProc.kill("SIGKILL"); } catch {}
+    track.prefetchProc = null;
+  }
+  if (track?.file) {
+    try { rmSync(track.file, { force: true }); } catch {}
+    track.file = null;
+  }
+}
+
+function prefetch(track) {
+  const base = `${TRACKS_DIR}/${track.seq}-${Date.now()}`;
+  const proc = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "--no-playlist", "-q", "-o", `${base}.%(ext)s`, track.url]);
+  track.prefetchProc = proc;
+  proc.on("error", () => {});
+  proc.on("exit", (code) => {
+    track.prefetchProc = null;
+    const name = base.split("/").pop();
+    const found = readdirSync(TRACKS_DIR).find((f) => f.startsWith(name));
+    if (code === 0 && found) {
+      track.file = `${TRACKS_DIR}/${found}`;
+      console.log(`[preload] pronto: ${track.title}`);
+    } else {
+      if (found) try { rmSync(`${TRACKS_DIR}/${found}`, { force: true }); } catch {}
+      console.log(`[preload] falhou (${code}): ${track.title} — cai pro streaming`);
+    }
+  });
+}
+
 function playNext(gs) {
   killProcs(gs);
   unduck(gs);
+  dropTrackFile(gs.current);
   const next = gs.queue.shift();
   gs.current = next ?? null;
   gs.currentResource = null;
   if (!next) return;
-  console.log(`[player] tocando: ${next.title}`);
-  const ytdlp = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", next.url]);
-  const ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"]);
-  ytdlp.stderr.on("data", (d) => console.log(`[yt-dlp] ${d.toString().trim().slice(0, 200)}`));
-  ytdlp.stdout.pipe(ff.stdin);
-  ff.stdin.on("error", () => {});
-  ytdlp.on("error", (e) => console.log("[yt-dlp] erro:", e.message));
+  let ff;
+  if (next.file && existsSync(next.file)) {
+    console.log(`[player] tocando (preload): ${next.title}`);
+    ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", next.file, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"]);
+    gs.procs = [ff];
+  } else {
+    console.log(`[player] tocando (streaming): ${next.title}`);
+    if (next.prefetchProc) dropTrackFile(next);
+    const ytdlp = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", next.url]);
+    ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"]);
+    ytdlp.stderr.on("data", (d) => console.log(`[yt-dlp] ${d.toString().trim().slice(0, 200)}`));
+    ytdlp.stdout.pipe(ff.stdin);
+    ff.stdin.on("error", () => {});
+    ytdlp.on("error", (e) => console.log("[yt-dlp] erro:", e.message));
+    gs.procs = [ytdlp, ff];
+  }
   ff.on("error", (e) => console.log("[ffmpeg] erro:", e.message));
-  gs.procs = [ytdlp, ff];
   const resource = createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
   gs.currentResource = resource;
   gs.player.play(resource);
@@ -386,11 +427,13 @@ async function enqueue(gs, rawQuery, by) {
   if (gs.player.state.status === AudioPlayerStatus.Idle || !gs.current) {
     playNext(gs);
   } else {
+    prefetch(track);
     gs.textChannel?.send({ embeds: [queuedEmbed(track, gs.queue.indexOf(track) + 1)] }).catch(() => {});
   }
 }
 
 function stopAll(gs) {
+  for (const t of [gs.current, ...gs.queue]) dropTrackFile(t);
   gs.queue = [];
   gs.current = null;
   gs.currentResource = null;
