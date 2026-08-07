@@ -9,6 +9,7 @@ import {
   createAudioPlayer,
   createAudioResource,
   EndBehaviorType,
+  getVoiceConnection,
   joinVoiceChannel,
   NoSubscriberBehavior,
   StreamType,
@@ -69,6 +70,8 @@ function getState(guildId) {
       duckTimer: null,
       seqCounter: 0,
       recentEnqueued: new Map(),
+      recentCommands: new Map(),
+      dead: false,
     });
   }
   return guilds.get(guildId);
@@ -526,10 +529,23 @@ function stopAll(gs) {
   gs.player.stop();
 }
 
+function teardown(gs) {
+  if (guilds.get(gs.guildId) === gs) guilds.delete(gs.guildId);
+  gs.dead = true;
+  try {
+    for (const t of [gs.current, ...gs.queue]) dropTrackFile(t);
+    gs.queue = [];
+    gs.current = null;
+    killProcs(gs);
+    gs.player?.stop();
+  } catch {}
+  try {
+    if (gs.connection && gs.connection.state.status !== "destroyed") gs.connection.destroy();
+  } catch {}
+}
+
 function leave(gs) {
-  stopAll(gs);
-  try { gs.connection?.destroy(); } catch {}
-  guilds.delete(gs.guildId);
+  teardown(gs);
 }
 
 function to16kMono(pcm) {
@@ -577,10 +593,30 @@ async function groqTranscribe(pcm) {
     signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) {
-    console.log("[stt] groq resposta", res.status, (await res.text()).slice(0, 200));
+    console.log("[stt] groq resposta", res.status, (await res.text()).slice(0, 120));
+    if (res.status === 429 || res.status >= 500) return localTranscribe(pcm);
     return null;
   }
   return ((await res.json()).text ?? "").trim() || null;
+}
+
+async function localTranscribe(pcm) {
+  try {
+    const res = await fetch(STT_URL, {
+      method: "POST",
+      body: pcm,
+      headers: { "content-type": "application/octet-stream" },
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) {
+      console.log("[stt] local resposta", res.status);
+      return null;
+    }
+    return (await res.json()).text;
+  } catch (e) {
+    console.log("[stt] local erro:", e.message);
+    return null;
+  }
 }
 
 async function transcribe(pcm, priority = false) {
@@ -591,18 +627,7 @@ async function transcribe(pcm, priority = false) {
   }
   sttPending++;
   try {
-    if (GROQ_KEY) return await groqTranscribe(pcm);
-    const res = await fetch(STT_URL, {
-      method: "POST",
-      body: pcm,
-      headers: { "content-type": "application/octet-stream" },
-      signal: AbortSignal.timeout(30000),
-    });
-    if (!res.ok) {
-      console.log("[stt] resposta", res.status);
-      return null;
-    }
-    return (await res.json()).text;
+    return GROQ_KEY ? await groqTranscribe(pcm) : await localTranscribe(pcm);
   } catch (e) {
     console.log("[stt] erro:", e.message);
     return null;
@@ -612,6 +637,7 @@ async function transcribe(pcm, priority = false) {
 }
 
 function captureUtterance(gs, userId) {
+  if (gs.dead || guilds.get(gs.guildId) !== gs) return;
   if (gs.listening.has(userId)) return;
   const user = client.users.cache.get(userId);
   if (user?.bot) return;
@@ -652,8 +678,16 @@ function captureUtterance(gs, userId) {
 }
 
 function handleVoice(gs, userId, raw, startedAt) {
+  if (gs.dead || guilds.get(gs.guildId) !== gs) return;
   const text = norm(raw);
   if (!text) return;
+  const dupeKey = `${userId}:${text}`;
+  if (Date.now() - (gs.recentCommands.get(dupeKey) ?? 0) < 6000) {
+    console.log(`[wake] comando repetido ignorado: "${text}"`);
+    return;
+  }
+  gs.recentCommands.set(dupeKey, Date.now());
+  if (gs.recentCommands.size > 40) gs.recentCommands.delete(gs.recentCommands.keys().next().value);
   const words = text.split(" ");
   const wakeIdx = words.findIndex(isWakeWord);
   const attentive = (gs.attention.get(userId) ?? 0) > startedAt;
@@ -730,6 +764,11 @@ function joinFor(member, channel) {
   if (gs.connection) return gs;
   const voice = member.voice.channel;
   if (!voice) return null;
+  const zombie = getVoiceConnection(member.guild.id);
+  if (zombie) {
+    console.log("[voz] destruindo conexão órfã antes de entrar");
+    try { zombie.destroy(); } catch {}
+  }
   gs.connection = joinVoiceChannel({
     channelId: voice.id,
     guildId: member.guild.id,
@@ -738,9 +777,10 @@ function joinFor(member, channel) {
     selfMute: false,
   });
   gs.connection.on("stateChange", (oldS, newS) => {
+    if (oldS.status === newS.status) return;
     console.log(`[voz] conexão: ${oldS.status} -> ${newS.status}`);
     if (newS.status === "destroyed" || newS.status === "disconnected") {
-      guilds.delete(gs.guildId);
+      teardown(gs);
     }
   });
   gs.connection.on("error", (e) => console.log("[voz] erro de conexão:", e.message));
