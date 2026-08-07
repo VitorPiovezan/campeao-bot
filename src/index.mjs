@@ -859,16 +859,27 @@ async function selfTestYoutube() {
     const file = `${INFO_DIR}/selftest.info.json`;
     writeFileSync(file, JSON.stringify(info));
     const tExtract = Date.now() - t0;
-    const t1 = Date.now();
-    const bytes = await new Promise((resolve) => {
-      const p = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "-q", "-o", "-", "--load-info-json", file]);
-      let n = 0;
-      const done = (v) => { try { p.kill("SIGKILL"); } catch {} resolve(v); };
-      p.stdout.on("data", (d) => { n += d.length; if (n > 200000) done(n); });
-      p.on("exit", () => resolve(n));
-      setTimeout(() => done(n), 20000);
-    });
-    console.log(`[selftest] youtube OK: extração ${tExtract}ms | info reaproveitado ${Date.now() - t1}ms (${bytes} bytes) | ${info.title?.slice(0, 50)}`);
+    const measure = (args, label) =>
+      new Promise((resolve) => {
+        const t = Date.now();
+        const p = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "-q", "-o", "-", ...args]);
+        let n = 0;
+        let ttfb = null;
+        const done = () => {
+          try { p.kill("SIGKILL"); } catch {}
+          resolve(`${label}: 1º byte ${ttfb ?? "—"}ms, ${Math.round(n / 1024)}KB em ${Date.now() - t}ms`);
+        };
+        p.stdout.on("data", (d) => {
+          if (ttfb === null) ttfb = Date.now() - t;
+          n += d.length;
+          if (n > 400000) done();
+        });
+        p.on("exit", done);
+        setTimeout(done, 25000);
+      });
+    const viaInfo = await measure(["--load-info-json", file], "info");
+    const viaFull = await measure(["--no-playlist", "https://www.youtube.com/watch?v=SRXH9AbT280"], "completa");
+    console.log(`[selftest] extração ${tExtract}ms | ${viaInfo} | ${viaFull}`);
   } catch (e) {
     const err = `${e.stderr || ""}${e.message || ""}`;
     const relevant = err
