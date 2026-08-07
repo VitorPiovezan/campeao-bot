@@ -1,5 +1,6 @@
 import { spawn, execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { Client, Events, GatewayIntentBits } from "discord.js";
@@ -32,8 +33,10 @@ const ATTENTION_MS = 2500;
 const DUCK_VOLUME = 0.15;
 const DUCK_TIMEOUT_MS = 8000;
 const BEEP_FILE = "/tmp/beep.pcm";
-const TRACKS_DIR = "/tmp/tracks";
-mkdirSync(TRACKS_DIR, { recursive: true });
+const CACHE_DIR = "/data/tracks";
+const CACHE_MAX_FILES = 40;
+const STREAM_URL_TTL_MS = 90 * 60 * 1000;
+mkdirSync(CACHE_DIR, { recursive: true });
 
 const guilds = new Map();
 
@@ -149,7 +152,7 @@ async function runYtdlp(args) {
   }
 }
 
-const PRINT_FULL = ["--print", "%(title)s\t%(webpage_url)s\t%(channel)s\t%(duration)s\t%(thumbnail)s"];
+const PRINT_FULL = ["--print", "%(title)s\t%(webpage_url)s\t%(channel)s\t%(duration)s\t%(thumbnail)s\t%(urls)s"];
 const PRINT_FLAT = ["--print", "%(title)s\t%(url)s\t%(channel)s\t%(duration)s\t%(thumbnail)s"];
 
 function parseCandidates(stdout) {
@@ -158,13 +161,14 @@ function parseCandidates(stdout) {
     .split("\n")
     .filter(Boolean)
     .map((line) => {
-      const [title, url, channel, duration, thumbnail] = line.split("\t");
+      const [title, url, channel, duration, thumbnail, streamUrl] = line.split("\t");
       return {
         title,
         url,
         channel: channel === "NA" ? "" : (channel ?? ""),
         duration: Number.parseFloat(duration) || null,
         thumbnail: thumbnail && thumbnail !== "NA" ? thumbnail : null,
+        streamUrl: streamUrl?.startsWith("http") ? streamUrl : null,
       };
     })
     .filter((c) => c.url);
@@ -207,7 +211,9 @@ async function resolveTrack(query, source = "auto") {
   if (/^https?:\/\//.test(query)) {
     try {
       const c = parseCandidates(await runYtdlp(["--no-playlist", "-f", "bestaudio/best", ...PRINT_FULL, query]))[0];
-      return c ? { title: c.title, url: c.url, source: "url", thumb: c.thumbnail, duration: c.duration } : null;
+      return c
+        ? { title: c.title, url: c.url, source: "url", thumb: c.thumbnail, duration: c.duration, streamUrl: c.streamUrl, resolvedAt: Date.now() }
+        : null;
     } catch (e) {
       console.log(`[busca] url falhou: ${shortErr(e)}`);
       return null;
@@ -240,6 +246,8 @@ async function resolveTrack(query, source = "auto") {
               source: "youtube",
               thumb: dzMeta?.cover ?? ok.thumbnail,
               duration: dzMeta?.duration ?? ok.duration,
+              streamUrl: ok.streamUrl,
+              resolvedAt: Date.now(),
             };
           }
         } catch (e) {
@@ -266,6 +274,8 @@ async function resolveTrack(query, source = "auto") {
           source: "soundcloud",
           thumb: dzMeta?.cover ?? best.thumbnail,
           duration: dzMeta?.duration ?? best.duration,
+          streamUrl: best.streamUrl,
+          resolvedAt: Date.now(),
         };
       }
     } catch (e) {
@@ -275,54 +285,96 @@ async function resolveTrack(query, source = "auto") {
   return null;
 }
 
+const cacheKey = (url) => createHash("sha1").update(url).digest("hex").slice(0, 16);
+
+function cacheLookup(url) {
+  const key = cacheKey(url);
+  const found = readdirSync(CACHE_DIR).find((f) => f.startsWith(key) && !f.endsWith(".part"));
+  return found ? `${CACHE_DIR}/${found}` : null;
+}
+
+function cacheCleanPartials(url) {
+  const key = cacheKey(url);
+  for (const f of readdirSync(CACHE_DIR)) {
+    if (f.startsWith(key) && (f.endsWith(".part") || f.includes(".part-"))) {
+      try { rmSync(`${CACHE_DIR}/${f}`, { force: true }); } catch {}
+    }
+  }
+}
+
+function cacheEvict() {
+  const files = readdirSync(CACHE_DIR)
+    .filter((f) => !f.endsWith(".part"))
+    .map((f) => {
+      const st = statSync(`${CACHE_DIR}/${f}`);
+      return st.isFile() ? { f, t: st.mtimeMs } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.t - b.t);
+  for (const { f } of files.slice(0, Math.max(0, files.length - CACHE_MAX_FILES))) {
+    try { rmSync(`${CACHE_DIR}/${f}`, { force: true }); } catch {}
+    console.log(`[cache] removido: ${f}`);
+  }
+}
+
 function dropTrackFile(track) {
   if (track?.prefetchProc) {
     try { track.prefetchProc.kill("SIGKILL"); } catch {}
     track.prefetchProc = null;
-  }
-  if (track?.file) {
-    try { rmSync(track.file, { force: true }); } catch {}
-    track.file = null;
+    if (track.url) cacheCleanPartials(track.url);
   }
 }
 
-function prefetch(track) {
-  const base = `${TRACKS_DIR}/${track.seq}-${Date.now()}`;
-  const proc = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "--no-playlist", "-q", "-o", `${base}.%(ext)s`, track.url]);
+function prefetch(track, tag = "preload") {
+  const hit = cacheLookup(track.url);
+  if (hit) {
+    track.file = hit;
+    console.log(`[${tag}] já em cache: ${track.title}`);
+    return;
+  }
+  if (track.prefetchProc) return;
+  const key = cacheKey(track.url);
+  const proc = spawn("yt-dlp", [
+    ...YTDLP_BASE, "-f", "bestaudio/best", "--no-playlist", "-q",
+    "-o", `${CACHE_DIR}/${key}.%(ext)s`, track.url,
+  ]);
   track.prefetchProc = proc;
   proc.on("error", () => {});
   proc.on("exit", (code) => {
     track.prefetchProc = null;
-    const name = base.split("/").pop();
-    const found = readdirSync(TRACKS_DIR).find((f) => f.startsWith(name));
-    if (code === 0 && found) {
-      track.file = `${TRACKS_DIR}/${found}`;
-      console.log(`[preload] pronto: ${track.title}`);
+    const done = code === 0 ? cacheLookup(track.url) : null;
+    if (done) {
+      track.file = done;
+      cacheEvict();
+      console.log(`[${tag}] pronto: ${track.title}`);
     } else {
-      if (found) try { rmSync(`${TRACKS_DIR}/${found}`, { force: true }); } catch {}
-      console.log(`[preload] falhou (${code}): ${track.title} — cai pro streaming`);
+      cacheCleanPartials(track.url);
+      console.log(`[${tag}] falhou (${code}): ${track.title}`);
     }
   });
 }
 
-function playNext(gs) {
+const FF_FAST = ["-analyzeduration", "0", "-probesize", "500K"];
+const FF_HTTP = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"];
+const FF_OUT = ["-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"];
+
+function startPlayback(gs, track, mode) {
   killProcs(gs);
-  unduck(gs);
-  dropTrackFile(gs.current);
-  const next = gs.queue.shift();
-  gs.current = next ?? null;
-  gs.currentResource = null;
-  if (!next) return;
   let ff;
-  if (next.file && existsSync(next.file)) {
-    console.log(`[player] tocando (preload): ${next.title}`);
-    ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", next.file, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"]);
+  if (mode === "cache") {
+    console.log(`[player] tocando (cache): ${track.title}`);
+    ff = spawn("ffmpeg", ["-loglevel", "quiet", ...FF_FAST, "-i", track.file, ...FF_OUT]);
     gs.procs = [ff];
+  } else if (mode === "direto") {
+    console.log(`[player] tocando (link direto): ${track.title}`);
+    ff = spawn("ffmpeg", ["-loglevel", "quiet", ...FF_HTTP, ...FF_FAST, "-i", track.streamUrl, ...FF_OUT]);
+    gs.procs = [ff];
+    prefetch(track, "cache");
   } else {
-    console.log(`[player] tocando (streaming): ${next.title}`);
-    if (next.prefetchProc) dropTrackFile(next);
-    const ytdlp = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", next.url]);
-    ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"]);
+    console.log(`[player] tocando (extração completa): ${track.title}`);
+    dropTrackFile(track);
+    const ytdlp = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "--no-playlist", "-q", "-o", "-", track.url]);
+    ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", ...FF_OUT]);
     ytdlp.stderr.on("data", (d) => console.log(`[yt-dlp] ${d.toString().trim().slice(0, 200)}`));
     ytdlp.stdout.pipe(ff.stdin);
     ff.stdin.on("error", () => {});
@@ -333,6 +385,20 @@ function playNext(gs) {
   const resource = createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
   gs.currentResource = resource;
   gs.player.play(resource);
+}
+
+function playNext(gs) {
+  killProcs(gs);
+  unduck(gs);
+  dropTrackFile(gs.current);
+  const next = gs.queue.shift();
+  gs.current = next ?? null;
+  gs.currentResource = null;
+  if (!next) return;
+  const cached = next.file && existsSync(next.file) ? next.file : cacheLookup(next.url);
+  if (cached) next.file = cached;
+  const streamFresh = next.streamUrl && Date.now() - (next.resolvedAt ?? 0) < STREAM_URL_TTL_MS;
+  startPlayback(gs, next, cached ? "cache" : streamFresh ? "direto" : "completa");
   gs.textChannel?.send({ embeds: [nowPlayingEmbed(next)] }).catch(() => {});
 }
 
@@ -664,7 +730,16 @@ function joinFor(member, channel) {
   gs.connection.subscribe(gs.player);
   gs.player.on(AudioPlayerStatus.Idle, (oldState) => {
     if (oldState.resource !== gs.currentResource) return;
-    if (gs.current) playNext(gs);
+    const cur = gs.current;
+    if (cur && !cur.retried && (oldState.resource.playbackDuration ?? 0) < 1500) {
+      cur.retried = true;
+      cur.file = null;
+      cur.streamUrl = null;
+      console.log(`[player] áudio não iniciou, refazendo pela via longa: ${cur.title}`);
+      startPlayback(gs, cur, "completa");
+      return;
+    }
+    if (cur) playNext(gs);
   });
   gs.player.on("error", (e) => {
     console.log("[player] erro:", e.message);
