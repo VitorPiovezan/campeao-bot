@@ -725,10 +725,10 @@ async function selfTestYoutube() {
     const err = `${e.stderr || ""}${e.message || ""}`;
     const relevant = err
       .split("\n")
-      .filter((l) => /pot|client|sign in|player|extracting|error/i.test(l))
-      .slice(0, 12)
+      .filter((l) => /pot|sign in|player|error|warning/i.test(l))
+      .slice(-20)
       .join(" § ");
-    console.log(`[selftest] youtube FALHOU: ${relevant.replace(/\s+/g, " ").slice(0, 800)}`);
+    console.log(`[selftest] youtube FALHOU: ${relevant.replace(/\s+/g, " ").slice(0, 2500)}`);
   }
 }
 setTimeout(selfTestYoutube, 8000);
