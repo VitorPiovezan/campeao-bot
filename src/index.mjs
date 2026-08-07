@@ -881,12 +881,13 @@ async function selfTestYoutube() {
     console.log(`[selftest] ${await measure(["--load-info-json", file], "aquecimento")}`);
     const base = ["--js-runtimes", "node", "--remote-components", "ejs:github", ...(hasCookies ? ["--cookies", COOKIES_FILE] : [])];
     const withPot = POT_URL ? ["--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_URL}`] : [];
+    const full = [...base, ...withPot];
     const trials = [
-      ["padrao (cookies+POT)", [...base, ...withPot], "kJQP7kiw5Fk"],
-      ["so cookies (sem POT)", base, "9bZkp7q19f0"],
-      ["client tv", [...base, ...withPot, "--extractor-args", "youtube:player_client=tv"], "fJ9rUzIMcZQ"],
+      ["baseline", full, "JGwWNGJdvx8", []],
+      ["chunk 100K", full, "RgKAFK5djSk", ["--http-chunk-size", "100K"]],
+      ["buffer 16K", full, "OPf0YbXqDm0", ["--buffer-size", "16K", "--no-resize-buffer"]],
     ];
-    for (const [label, argv, vid] of trials) {
+    for (const [label, argv, vid, dlFlags] of trials) {
       try {
         const te = Date.now();
         const { stdout } = await execFileP("yt-dlp", [...argv, "--no-playlist", "-f", "bestaudio/best", "-J", `https://www.youtube.com/watch?v=${vid}`], { timeout: 90000, maxBuffer: 64 * 1024 * 1024 });
@@ -896,7 +897,7 @@ async function selfTestYoutube() {
         const extractMs = Date.now() - te;
         const td = Date.now();
         const r = await new Promise((resolve) => {
-          const p = spawn("yt-dlp", [...argv, "-f", "bestaudio/best", "-q", "-o", "-", "--load-info-json", fp]);
+          const p = spawn("yt-dlp", [...argv, ...dlFlags, "-f", "bestaudio/best", "-q", "-o", "-", "--load-info-json", fp]);
           let n = 0, ttfb = null;
           const fin = () => { try { p.kill("SIGKILL"); } catch {} resolve(`1º byte ${ttfb ?? "—"}ms`); };
           p.stdout.on("data", (d) => { if (ttfb === null) ttfb = Date.now() - td; n += d.length; if (n > 300000) fin(); });
