@@ -660,7 +660,7 @@ const helpEmbed = () => ({
     'Com música tocando, diga só *"Campeão"*: o som abaixa e eu escuto por 2s.',
     '**Fonte específica**: *"…no YouTube"* ou *"…no SoundCloud"*. Sem indicar, o Deezer identifica a faixa oficial.',
     "**Slash**: `/tocar` sugere músicas enquanto você digita — e tem `/fila` `/radio` `/letra` `/vetar` `/pular` `/parar` `/sair`.",
-    "**Por texto**: `!entra` `!play` `!pula` `!pausa` `!continua` `!para` `!fila` `!radio` `!letra` `!sai`",
+    "**Por texto**: `!entra` `!play` `!pula` `!pausa` `!continua` `!para` `!fila` `!radio` `!veta` `!letra` `!sai`",
     '**Rádio**: *"Campeão, liga o rádio"* — quando a fila acaba, sigo tocando parecidas. *"Campeão, essa não"* veta a atual.',
     "Saio sozinho após 5 min sem música e sem comando, ou 1 min com o canal vazio.",
   ].join("\n"),
@@ -897,6 +897,7 @@ async function enqueue(gs, rawQuery, by) {
 
 function stopAll(gs) {
   for (const t of [gs.current, ...gs.queue]) dropTrackFile(t);
+  gs.radio = false;
   gs.queue = [];
   gs.current = null;
   gs.currentResource = null;
