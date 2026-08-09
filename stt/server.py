@@ -13,6 +13,12 @@ model = WhisperModel(
     cpu_threads=int(os.environ.get("WHISPER_THREADS", "4")),
 )
 lock = threading.Lock()
+INITIAL_PROMPT = os.environ.get(
+    "WHISPER_PROMPT",
+    "Campeão, toca, pula, pausa, continua, para, sai, fila, rádio, letra, música.",
+)
+BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "1"))
+STT_PORT = int(os.environ.get("STT_PORT", "5005"))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -24,8 +30,9 @@ class Handler(BaseHTTPRequestHandler):
             segments, _ = model.transcribe(
                 audio,
                 language="pt",
-                beam_size=1,
+                beam_size=BEAM_SIZE,
                 vad_filter=True,
+                initial_prompt=INITIAL_PROMPT,
             )
             text = " ".join(s.text for s in segments).strip()
         body = json.dumps({"text": text}).encode()
@@ -43,5 +50,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 ThreadingHTTPServer.request_queue_size = 64
-print("STT pronto na porta 5005", flush=True)
-ThreadingHTTPServer(("127.0.0.1", 5005), Handler).serve_forever()
+print(f"STT pronto na porta {STT_PORT}", flush=True)
+ThreadingHTTPServer(("127.0.0.1", STT_PORT), Handler).serve_forever()
