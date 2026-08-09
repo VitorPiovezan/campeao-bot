@@ -12,5 +12,5 @@ RUN npm install --omit=dev
 COPY . .
 ENV HF_HOME=/data/hf
 ENV XDG_CACHE_HOME=/data/cache
-VOLUME /data
+RUN mkdir -p /data/hf /data/cache
 CMD ["bash", "start.sh"]
