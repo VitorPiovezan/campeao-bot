@@ -934,15 +934,21 @@ function vetoCurrent(gs, by) {
   playNext(gs);
 }
 
-function humansIn(channelId) {
-  const ch = channelId ? client.channels.cache.get(channelId) : null;
-  if (!ch?.members) return 1;
+async function humansIn(guild, channelId) {
+  if (!channelId) return 0;
+  let ch = guild?.channels?.cache?.get(channelId) ?? client.channels.cache.get(channelId);
+  if (!ch) ch = await guild?.channels?.fetch(channelId).catch(() => null);
+  if (!ch?.members) {
+    console.log(`[voz] canal ${channelId} indisponivel, assumindo que ainda tem gente`);
+    return 1;
+  }
   return ch.members.filter((m) => !m.user.bot).size;
 }
 
-function checkIdle(gs) {
+async function checkIdle(gs) {
   if (gs.dead) return;
-  const alone = humansIn(gs.voiceChannelId) === 0;
+  const alone = (await humansIn(gs.guild, gs.voiceChannelId)) === 0;
+  if (gs.dead) return;
   if (alone) {
     gs.emptySince ??= Date.now();
     if (Date.now() - gs.emptySince > EMPTY_MS) {
@@ -1334,13 +1340,13 @@ function moveTo(gs, voice) {
   if (gs.current) setVoiceStatus(gs, trackStatus(gs.current));
 }
 
-function joinFor(member, channel) {
+async function joinFor(member, channel) {
   const existing = guilds.get(member.guild.id);
   const voice = member.voice.channel;
   if (existing?.connection) {
     if (channel) existing.textChannel = channel;
     if (voice && voice.id !== existing.voiceChannelId) {
-      if (humansIn(existing.voiceChannelId) > 0) {
+      if ((await humansIn(existing.guild ?? member.guild, existing.voiceChannelId)) > 0) {
         return { error: "busy", channelId: existing.voiceChannelId };
       }
       moveTo(existing, voice);
@@ -1410,7 +1416,9 @@ function connect(guild, voice, channel) {
   });
   gs.connection.receiver.speaking.on("start", (userId) => captureUtterance(gs, userId));
   gs.lastActivity = Date.now();
-  gs.idleTimer = setInterval(() => checkIdle(gs), 30000);
+  gs.idleTimer = setInterval(() => {
+    checkIdle(gs).catch((e) => console.log("[idle] erro:", e.message));
+  }, 30000);
   console.log(`[voz] entrei em "${voice.name}" (${guild.name})`);
   return gs;
 }
@@ -1431,7 +1439,7 @@ client.on(Events.MessageCreate, async (m) => {
   const command = cmd.toLowerCase();
 
   if (["entra", "play", "p", "toca"].includes(command)) {
-    const { gs, error, channelId } = joinFor(m.member, m.channel);
+    const { gs, error, channelId } = await joinFor(m.member, m.channel);
     if (error === "no_voice") {
       m.reply("-# Entre num canal de voz primeiro").catch(() => {});
       return;
@@ -1545,7 +1553,7 @@ async function handleSlash(i) {
     return;
   }
   if (name === "tocar") {
-    const { gs, error, channelId } = joinFor(i.member, i.channel);
+    const { gs, error, channelId } = await joinFor(i.member, i.channel);
     if (error === "no_voice") {
       await i.reply({ content: "-# Entre num canal de voz primeiro", flags: MessageFlags.Ephemeral }).catch(() => {});
       return;
