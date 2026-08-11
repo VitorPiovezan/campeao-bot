@@ -72,6 +72,7 @@ function getState(guildId) {
       recentEnqueued: new Map(),
       recentCommands: new Map(),
       hotUsers: new Map(),
+      lastGateAt: new Map(),
       dead: false,
       radio: false,
       radioFilling: false,
@@ -822,12 +823,17 @@ async function transcribe(pcm, priority = false) {
 }
 
 const GATE_SECONDS = 1.5;
-const GATE_CONCURRENCY = 3;
+const GATE_CONCURRENCY = 2;
 const GATE_QUEUE_TIMEOUT_MS = 2500;
+const GATE_MIN_INTERVAL_MS = 1200;
+const GATE_MIN_INTERVAL_BUSY_MS = 3000;
 const HOT_USER_MS = 60000;
-const MAX_UTTERANCE_SECONDS = 15;
-const COMMAND_MAX_SECONDS = 12;
-const gateStats = { pass: 0, block: 0, busy: 0, gateMs: [], groqMs: [] };
+const MAX_UTTERANCE_SECONDS = 8;
+const COMMAND_MAX_SECONDS = 8;
+const gateStats = { pass: 0, block: 0, busy: 0, throttled: 0, gateMs: [], groqMs: [] };
+
+const sliceSeconds = (pcm, seconds) =>
+  pcm.subarray(0, Math.min(pcm.length, Math.floor(seconds * 48000) * 4));
 
 const avg = (list) => (list.length ? Math.round(list.reduce((a, b) => a + b, 0) / list.length) : 0);
 
@@ -862,9 +868,21 @@ class Semaphore {
     this.active--;
     this.waiters.shift()?.grant();
   }
+
+  get saturated() {
+    return this.active >= this.limit;
+  }
 }
 
 const gateSem = new Semaphore(GATE_CONCURRENCY);
+
+function gateAllowed(gs, userId) {
+  const minInterval = gateSem.saturated ? GATE_MIN_INTERVAL_BUSY_MS : GATE_MIN_INTERVAL_MS;
+  const last = gs.lastGateAt.get(userId) ?? 0;
+  if (Date.now() - last < minInterval) return false;
+  gs.lastGateAt.set(userId, Date.now());
+  return true;
+}
 
 const GATE_STOP = new Set([
   "campo", "campos", "campanha", "compra", "comprar", "comprei", "compras", "compro",
@@ -895,9 +913,8 @@ async function gateWake(pcm16, who) {
   }
   const waited = Date.now() - queuedAt;
   try {
-    const head = pcm16.subarray(0, Math.min(pcm16.length, Math.round(16000 * 2 * GATE_SECONDS)));
     const startedAt = Date.now();
-    const text = await localTranscribe(head, "/gate");
+    const text = await localTranscribe(pcm16, "/gate");
     gateStats.gateMs.push(Date.now() - startedAt + waited);
     const ok = gateHasWake(text);
     if (ok) {
@@ -918,15 +935,16 @@ async function gateWake(pcm16, who) {
 }
 
 setInterval(() => {
-  const { pass, block, busy, gateMs, groqMs } = gateStats;
-  if (pass + block + busy > 0) {
+  const { pass, block, busy, throttled, gateMs, groqMs } = gateStats;
+  if (pass + block + busy + throttled > 0) {
     console.log(
-      `[gate] 5min: ${pass} p/ groq, ${block} barradas, ${busy} perdidas na fila ` +
+      `[gate] 5min: ${pass} p/ groq, ${block} barradas, ${throttled} throttled, ${busy} perdidas na fila ` +
         `| porteiro ${avg(gateMs)}ms (máx ${Math.max(0, ...gateMs)}ms) | groq ${avg(groqMs)}ms`
     );
     gateStats.pass = 0;
     gateStats.block = 0;
     gateStats.busy = 0;
+    gateStats.throttled = 0;
     gateStats.gateMs = [];
     gateStats.groqMs = [];
   }
@@ -967,14 +985,21 @@ function captureUtterance(gs, userId) {
     const attentive = (gs.attention.get(userId) ?? 0) > startedAt;
     if (attentive) playBeep(gs);
     const hot = (gs.hotUsers.get(userId) ?? 0) > Date.now();
-    const pcm16 = to16kMono(pcm);
     const priority = attentive || hot;
-    if (!priority && GROQ_KEY && !(await gateWake(pcm16, user?.username ?? userId))) return;
-    const forGroq = pcm16.subarray(0, Math.round(16000 * 2 * COMMAND_MAX_SECONDS));
-    const text = await transcribe(forGroq, priority);
-    console.log(
-      `[stt] ${user?.username ?? userId}${hot && !attentive ? " (atalho)" : ""}: "${text}" [${Date.now() - finishedAt}ms]`
-    );
+    const who = user?.username ?? userId;
+
+    if (!priority && GROQ_KEY) {
+      if (!gateAllowed(gs, userId)) {
+        gateStats.throttled++;
+        return;
+      }
+      const head = to16kMono(sliceSeconds(pcm, GATE_SECONDS));
+      if (!(await gateWake(head, who))) return;
+    }
+
+    const pcm16 = to16kMono(sliceSeconds(pcm, COMMAND_MAX_SECONDS));
+    const text = await transcribe(pcm16, priority);
+    console.log(`[stt] ${who}${hot && !attentive ? " (atalho)" : ""}: "${text}" [${Date.now() - finishedAt}ms]`);
     if (text) handleVoice(gs, userId, text, startedAt);
   });
   decoder.on("error", cleanup);
