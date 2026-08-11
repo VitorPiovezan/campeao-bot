@@ -71,6 +71,7 @@ function getState(guildId) {
       seqCounter: 0,
       recentEnqueued: new Map(),
       recentCommands: new Map(),
+      hotUsers: new Map(),
       dead: false,
       radio: false,
       radioFilling: false,
@@ -777,9 +778,9 @@ async function groqTranscribe(pcm) {
   return ((await res.json()).text ?? "").trim() || null;
 }
 
-async function localTranscribe(pcm) {
+async function localTranscribe(pcm, path = "") {
   try {
-    const res = await fetch(STT_URL, {
+    const res = await fetch(`${STT_URL}${path.replace(/^\//, "")}`, {
       method: "POST",
       body: pcm,
       headers: { "content-type": "application/octet-stream" },
@@ -803,6 +804,7 @@ async function transcribe(pcm, priority = false) {
     return null;
   }
   sttPending++;
+  const startedAt = Date.now();
   try {
     if (!GROQ_KEY) return await localTranscribe(pcm);
     if (!groqSlotFree()) {
@@ -814,14 +816,55 @@ async function transcribe(pcm, priority = false) {
     console.log("[stt] erro:", e.message);
     return null;
   } finally {
+    gateStats.groqMs.push(Date.now() - startedAt);
     sttPending--;
   }
 }
 
-const GATE_SECONDS = 2.5;
-const GATE_MAX_CONCURRENT = 2;
-let gatePending = 0;
-const gateStats = { pass: 0, block: 0, busy: 0 };
+const GATE_SECONDS = 1.5;
+const GATE_CONCURRENCY = 3;
+const GATE_QUEUE_TIMEOUT_MS = 2500;
+const HOT_USER_MS = 60000;
+const MAX_UTTERANCE_SECONDS = 15;
+const COMMAND_MAX_SECONDS = 12;
+const gateStats = { pass: 0, block: 0, busy: 0, gateMs: [], groqMs: [] };
+
+const avg = (list) => (list.length ? Math.round(list.reduce((a, b) => a + b, 0) / list.length) : 0);
+
+class Semaphore {
+  constructor(limit) {
+    this.limit = limit;
+    this.active = 0;
+    this.waiters = [];
+  }
+
+  acquire(timeoutMs) {
+    if (this.active < this.limit) {
+      this.active++;
+      return Promise.resolve(true);
+    }
+    return new Promise((resolve) => {
+      const waiter = {};
+      waiter.timer = setTimeout(() => {
+        this.waiters = this.waiters.filter((w) => w !== waiter);
+        resolve(false);
+      }, timeoutMs);
+      waiter.grant = () => {
+        clearTimeout(waiter.timer);
+        this.active++;
+        resolve(true);
+      };
+      this.waiters.push(waiter);
+    });
+  }
+
+  release() {
+    this.active--;
+    this.waiters.shift()?.grant();
+  }
+}
+
+const gateSem = new Semaphore(GATE_CONCURRENCY);
 
 const GATE_STOP = new Set([
   "campo", "campos", "campanha", "compra", "comprar", "comprei", "compras", "compro",
@@ -843,18 +886,25 @@ function gateHasWake(text) {
 }
 
 async function gateWake(pcm16, who) {
-  if (gatePending >= GATE_MAX_CONCURRENT) {
+  const queuedAt = Date.now();
+  const slot = await gateSem.acquire(GATE_QUEUE_TIMEOUT_MS);
+  if (!slot) {
     gateStats.busy++;
+    console.log(`[gate] ${who}: fila cheia por ${GATE_QUEUE_TIMEOUT_MS}ms, fala descartada`);
     return false;
   }
-  gatePending++;
+  const waited = Date.now() - queuedAt;
   try {
     const head = pcm16.subarray(0, Math.min(pcm16.length, Math.round(16000 * 2 * GATE_SECONDS)));
-    const text = await localTranscribe(head);
+    const startedAt = Date.now();
+    const text = await localTranscribe(head, "/gate");
+    gateStats.gateMs.push(Date.now() - startedAt + waited);
     const ok = gateHasWake(text);
     if (ok) {
       gateStats.pass++;
-      console.log(`[gate] ${who}: passou ("${(text ?? "").trim().slice(0, 40)}")`);
+      console.log(
+        `[gate] ${who}: passou em ${Date.now() - queuedAt}ms${waited > 50 ? ` (fila ${waited}ms)` : ""} ("${(text ?? "").trim().slice(0, 40)}")`
+      );
     } else {
       gateStats.block++;
     }
@@ -863,17 +913,22 @@ async function gateWake(pcm16, who) {
     console.log("[gate] erro, deixando passar:", e.message);
     return true;
   } finally {
-    gatePending--;
+    gateSem.release();
   }
 }
 
 setInterval(() => {
-  const { pass, block, busy } = gateStats;
+  const { pass, block, busy, gateMs, groqMs } = gateStats;
   if (pass + block + busy > 0) {
-    console.log(`[gate] 5min: ${pass} p/ groq, ${block} barradas, ${busy} descartadas (economia ${Math.round((100 * (block + busy)) / (pass + block + busy))}%)`);
+    console.log(
+      `[gate] 5min: ${pass} p/ groq, ${block} barradas, ${busy} perdidas na fila ` +
+        `| porteiro ${avg(gateMs)}ms (máx ${Math.max(0, ...gateMs)}ms) | groq ${avg(groqMs)}ms`
+    );
     gateStats.pass = 0;
     gateStats.block = 0;
     gateStats.busy = 0;
+    gateStats.gateMs = [];
+    gateStats.groqMs = [];
   }
 }, 5 * 60 * 1000);
 
@@ -904,16 +959,22 @@ function captureUtterance(gs, userId) {
     const pcm = Buffer.concat(chunks);
     const secs = pcm.length / (48000 * 2 * 2);
     if (secs < 0.6) return;
-    if (secs > 6) {
-      console.log(`[voz] descartando fala de ${secs.toFixed(1)}s (longa demais, provável vazamento de música)`);
+    if (secs > MAX_UTTERANCE_SECONDS) {
+      console.log(`[voz] descartando fala de ${secs.toFixed(1)}s (longa demais)`);
       return;
     }
+    const finishedAt = Date.now();
     const attentive = (gs.attention.get(userId) ?? 0) > startedAt;
     if (attentive) playBeep(gs);
+    const hot = (gs.hotUsers.get(userId) ?? 0) > Date.now();
     const pcm16 = to16kMono(pcm);
-    if (!attentive && GROQ_KEY && !(await gateWake(pcm16, user?.username ?? userId))) return;
-    const text = await transcribe(pcm16, attentive);
-    console.log(`[stt] ${user?.username ?? userId}: "${text}"`);
+    const priority = attentive || hot;
+    if (!priority && GROQ_KEY && !(await gateWake(pcm16, user?.username ?? userId))) return;
+    const forGroq = pcm16.subarray(0, Math.round(16000 * 2 * COMMAND_MAX_SECONDS));
+    const text = await transcribe(forGroq, priority);
+    console.log(
+      `[stt] ${user?.username ?? userId}${hot && !attentive ? " (atalho)" : ""}: "${text}" [${Date.now() - finishedAt}ms]`
+    );
     if (text) handleVoice(gs, userId, text, startedAt);
   });
   decoder.on("error", cleanup);
@@ -944,6 +1005,7 @@ function handleVoice(gs, userId, raw, startedAt) {
   }
   gs.attention.delete(userId);
   gs.lastActivity = Date.now();
+  gs.hotUsers.set(userId, Date.now() + HOT_USER_MS);
   console.log(`[wake] comando: "${rest}"`);
   const mention = `<@${userId}>`;
 
