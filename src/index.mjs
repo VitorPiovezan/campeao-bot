@@ -1,7 +1,7 @@
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { Readable } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { promisify } from "node:util";
 import { Client, Events, GatewayIntentBits } from "discord.js";
 import {
@@ -28,6 +28,8 @@ const YTDLP_BASE = [
   ...(hasCookies ? ["--cookies", COOKIES_FILE] : []),
   ...(POT_URL ? ["--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_URL}`] : []),
 ];
+const LOW_PRIO = ["--idle", "0", "nice", "-n", "19"];
+const spawnLow = (cmd, args) => spawn("chrt", [...LOW_PRIO, cmd, ...args]);
 const STT_URL = "http://127.0.0.1:5005/";
 const WAKE_WORDS = ["campeao", "campiao", "capiao", "campeaum", "campeon"];
 const ATTENTION_MS = 2500;
@@ -158,7 +160,7 @@ async function deezerLookup(query) {
 
 async function runYtdlp(args, opts = {}) {
   try {
-    const { stdout } = await execFileP("yt-dlp", [...YTDLP_BASE, ...args], {
+    const { stdout } = await execFileP("chrt", [...LOW_PRIO, "yt-dlp", ...YTDLP_BASE, ...args], {
       timeout: 60000,
       maxBuffer: 64 * 1024 * 1024,
       ...opts,
@@ -369,7 +371,7 @@ function prefetch(track, tag = "preload") {
   }
   if (track.prefetchProc) return;
   const key = cacheKey(track.url);
-  const proc = spawn("yt-dlp", [
+  const proc = spawnLow("yt-dlp", [
     ...YTDLP_BASE, "-f", "bestaudio/best", "-q",
     "-o", `${CACHE_DIR}/${key}.%(ext)s`, ...sourceArgs(track),
   ]);
@@ -392,6 +394,7 @@ function prefetch(track, tag = "preload") {
 
 const FF_FAST = ["-analyzeduration", "0", "-probesize", "500K"];
 const FF_OUT = ["-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"];
+const JITTER_BYTES = 20 * 48000 * 2 * 2;
 
 function startPlayback(gs, track, mode) {
   killProcs(gs);
@@ -414,7 +417,10 @@ function startPlayback(gs, track, mode) {
     prefetch(track, "cache");
   }
   ff.on("error", (e) => console.log("[ffmpeg] erro:", e.message));
-  const resource = createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
+  const jitter = new PassThrough({ highWaterMark: JITTER_BYTES });
+  jitter.on("error", () => {});
+  ff.stdout.pipe(jitter);
+  const resource = createAudioResource(jitter, { inputType: StreamType.Raw, inlineVolume: true });
   gs.currentResource = resource;
   gs.player.play(resource);
 }
@@ -823,7 +829,8 @@ async function transcribe(pcm, priority = false) {
 }
 
 const GATE_SECONDS = 1.5;
-const GATE_CONCURRENCY = 2;
+const GATE_CONCURRENCY = 1;
+const RESUBSCRIBE_COOLDOWN_MS = 1500;
 const GATE_QUEUE_TIMEOUT_MS = 2500;
 const GATE_MIN_INTERVAL_MS = 1200;
 const GATE_MIN_INTERVAL_BUSY_MS = 3000;
@@ -934,7 +941,32 @@ async function gateWake(pcm16, who) {
   }
 }
 
+const LOOP_TICK_MS = 50;
+const LOOP_STALL_MS = 40;
+const loopLag = { max: 0, sum: 0, stalls: 0, ticks: 0 };
+let loopLastTick = Date.now();
 setInterval(() => {
+  const now = Date.now();
+  const lag = now - loopLastTick - LOOP_TICK_MS;
+  loopLastTick = now;
+  loopLag.ticks++;
+  if (lag <= 0) return;
+  loopLag.sum += lag;
+  if (lag > loopLag.max) loopLag.max = lag;
+  if (lag >= LOOP_STALL_MS) loopLag.stalls++;
+}, LOOP_TICK_MS).unref();
+
+setInterval(() => {
+  if (loopLag.ticks > 0) {
+    console.log(
+      `[loop] 5min: lag médio ${(loopLag.sum / loopLag.ticks).toFixed(1)}ms, máx ${loopLag.max}ms, ` +
+        `${loopLag.stalls} travadas acima de ${LOOP_STALL_MS}ms`
+    );
+    loopLag.max = 0;
+    loopLag.sum = 0;
+    loopLag.stalls = 0;
+    loopLag.ticks = 0;
+  }
   const { pass, block, busy, throttled, gateMs, groqMs } = gateStats;
   if (pass + block + busy + throttled > 0) {
     console.log(
@@ -963,24 +995,31 @@ function captureUtterance(gs, userId) {
   const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
   const chunks = [];
   let bytes = 0;
+  let aborted = false;
   opus.pipe(decoder);
   decoder.on("data", (c) => {
+    if (aborted) return;
     bytes += c.length;
-    if (bytes < 48000 * 2 * 2 * 15) chunks.push(c);
+    if (bytes > MAX_UTTERANCE_SECONDS * 48000 * 2 * 2) {
+      aborted = true;
+      chunks.length = 0;
+      console.log(`[voz] fala passou de ${MAX_UTTERANCE_SECONDS}s, cortando captura`);
+      opus.destroy();
+      decoder.destroy();
+      setTimeout(() => gs.listening.delete(userId), RESUBSCRIBE_COOLDOWN_MS);
+      return;
+    }
+    chunks.push(c);
   });
   const cleanup = (e) => {
     if (e) console.log("[voz] erro no stream:", e.message);
-    gs.listening.delete(userId);
+    if (!aborted) gs.listening.delete(userId);
   };
   decoder.on("end", async () => {
     gs.listening.delete(userId);
     const pcm = Buffer.concat(chunks);
     const secs = pcm.length / (48000 * 2 * 2);
     if (secs < 0.6) return;
-    if (secs > MAX_UTTERANCE_SECONDS) {
-      console.log(`[voz] descartando fala de ${secs.toFixed(1)}s (longa demais)`);
-      return;
-    }
     const finishedAt = Date.now();
     const attentive = (gs.attention.get(userId) ?? 0) > startedAt;
     if (attentive) playBeep(gs);
@@ -1128,7 +1167,9 @@ function joinFor(member, channel) {
     }
   });
   gs.connection.on("error", (e) => console.log("[voz] erro de conexão:", e.message));
-  gs.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
+  gs.player = createAudioPlayer({
+    behaviors: { noSubscriber: NoSubscriberBehavior.Pause, maxMissedFrames: 50 },
+  });
   gs.connection.subscribe(gs.player);
   gs.player.on(AudioPlayerStatus.Idle, (oldState) => {
     if (oldState.resource !== gs.currentResource) return;
@@ -1291,7 +1332,7 @@ async function warmupYoutube() {
     writeFileSync(file, JSON.stringify(info));
     const tDl = Date.now();
     const ttfb = await new Promise((resolve) => {
-      const p = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "-q", "-o", "-", "--load-info-json", file]);
+      const p = spawnLow("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "-q", "-o", "-", "--load-info-json", file]);
       const fin = (v) => { try { p.kill("SIGKILL"); } catch {} resolve(v); };
       p.stdout.once("data", () => fin(Date.now() - tDl));
       p.on("exit", () => resolve(null));

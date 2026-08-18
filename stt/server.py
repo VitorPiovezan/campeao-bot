@@ -11,7 +11,7 @@ FULL_MODEL = os.environ.get("WHISPER_MODEL", "base")
 GATE_MODEL = os.environ.get("GATE_WHISPER_MODEL", "tiny")
 FULL_THREADS = int(os.environ.get("WHISPER_THREADS", "2"))
 GATE_THREADS = int(os.environ.get("GATE_WHISPER_THREADS", "1"))
-GATE_POOL_SIZE = int(os.environ.get("GATE_POOL", "3"))
+GATE_POOL_SIZE = int(os.environ.get("GATE_POOL", "2"))
 
 
 def load(name: str, threads: int) -> WhisperModel:
