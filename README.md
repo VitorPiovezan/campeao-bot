@@ -204,5 +204,18 @@ O mesmo bot toca também no [Parrot](https://parrot.arvore.dev), o chat interno 
 | `PARROT_BOT_TOKEN` | Token do bot `campeao` em `PARROT_BOT_TOKENS` do servidor |
 | `STT_URL` | Whisper local (padrão `http://127.0.0.1:5005/`) |
 | `CACHE_DIR` | Cache de faixas (padrão `/data/tracks`) |
+| `PARROT_BOT_NAME` | Nome do bot no Parrot (padrão: o nome do Discord, senão `Campeão`) |
+
+No boot o adapter copia nome e avatar do bot do Discord (`DISCORD_TOKEN`) pro perfil do Parrot — o avatar só sobe quando o hash muda.
 
 Uso: numa sala de voz, mande `!entra` num canal de texto. Daí `"Campeão, toca <música>"` por voz ou `!play <música>` por texto, igual ao Discord. O áudio entra na sala como uma faixa própria do bot; o bot ignora as faixas de soundboard e outros bots ao escutar.
+
+No Parrot o bot fala por **cards** (`src/cards.mjs`): player com posição, estado e botões (pausar, pular, não curti, parar, rádio, fila), card de fila, de faixa enfileirada (tocar agora · tirar da fila), avisos e ajuda. Clique em botão volta pelo WebSocket como `cardAction` e roda a mesma rotina do comando de texto, com o nome de quem clicou.
+
+Pra conferir os cards no app sem yt-dlp nem LiveKit:
+
+```bash
+PARROT_URL=... PARROT_BOT_TOKEN=... node scripts/parrot-cards-demo.mjs
+```
+
+Ele posta um de cada tipo no canal `geral` (ou `PARROT_DEMO_CHANNEL`), anima o player (tocando → pausada → rádio → terminou) e responde a cada clique. Ctrl+C encerra.
