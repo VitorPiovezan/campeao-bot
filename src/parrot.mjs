@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { AudioFrame, AudioSource, AudioStream, LocalAudioTrack, Room, RoomEvent, TrackKind, TrackPublishOptions, TrackSource } from "@livekit/rtc-node";
-import { helpCard, noteCard, playerCard, queueCard, queuedCard } from "./cards.mjs";
+import { helpCard, noteCard, playerCard, queueCard, queuedCard, stageOf } from "./cards.mjs";
 import {
   ATTENTION_MS, BEEP_FILE, COMMAND_MAX_SECONDS, DUCK_TIMEOUT_MS, DUCK_VOLUME, FF_FAST, FF_OUT, GROQ_KEY, HOT_USER_MS, LEAVE_VERBS,
   MAX_UTTERANCE_SECONDS, PAUSE_VERBS, PLAY_VERBS, PRINT_FLAT, REMIX_WORDS, RESUME_VERBS, SKIP_VERBS, STOP_VERBS, YTDLP_BASE,
@@ -84,37 +84,43 @@ const postCard = async (channelId, card) => {
 const note = (channelId, options) => postCard(channelId, noteCard(options));
 
 const EDIT_MIN_GAP_MS = 1000;
+const STAGE_KEY = "stage";
+const STAGE_DEBOUNCE_MS = 500;
 const edits = new Map();
 
-const flushEdit = (messageId) => {
-  const entry = edits.get(messageId);
+const flushEdit = (key) => {
+  const entry = edits.get(key);
   if (!entry?.pending) return;
-  const card = entry.pending;
+  const { payload, send } = entry.pending;
   entry.pending = null;
   entry.lastAt = Date.now();
-  if (entry.final) edits.delete(messageId);
-  api(`/channels/${entry.channelId}/messages/${messageId}`, { method: "PATCH", body: { card } }).catch((e) => log("chat", `falha ao editar card: ${e.message}`));
+  if (entry.final) edits.delete(key);
+  send(payload);
 };
 
-const scheduleEdit = (messageId, channelId, card, { delay = 0, final = false } = {}) => {
-  if (!messageId || !channelId) return;
-  const entry = edits.get(messageId) ?? { channelId, lastAt: 0, timer: null, pending: null, final: false };
+const scheduleSend = (key, send, payload, { delay = 0, final = false } = {}) => {
+  const entry = edits.get(key) ?? { lastAt: 0, timer: null, pending: null, final: false };
   if (entry.final) return;
-  entry.channelId = channelId;
-  entry.pending = card;
+  entry.pending = { payload, send };
   entry.final = final;
-  edits.set(messageId, entry);
+  edits.set(key, entry);
   if (entry.timer) clearTimeout(entry.timer);
   const wait = Math.max(delay, entry.lastAt + EDIT_MIN_GAP_MS - Date.now());
   if (wait <= 0) {
     entry.timer = null;
-    flushEdit(messageId);
+    flushEdit(key);
     return;
   }
   entry.timer = setTimeout(() => {
     entry.timer = null;
-    flushEdit(messageId);
+    flushEdit(key);
   }, wait);
+};
+
+const scheduleEdit = (messageId, channelId, card, options) => {
+  if (!messageId || !channelId) return;
+  const send = (body) => api(`/channels/${channelId}/messages/${messageId}`, { method: "PATCH", body: { card: body } }).catch((e) => log("chat", `falha ao editar card: ${e.message}`));
+  scheduleSend(messageId, send, card, options);
 };
 
 class PcmPlayer {
@@ -256,10 +262,22 @@ const positionNow = () => session.player?.playedMs ?? 0;
 
 const livePlayerCard = (track) => playerCard({ track, state: session.player?.paused ? "paused" : "playing", positionMs: positionNow(), radio: session.radio, queueLength: session.queue.length });
 
+const liveStage = () => {
+  if (!session.current && session.queue.length === 0) return null;
+  return stageOf({ current: session.current, positionMs: positionNow(), paused: Boolean(session.player?.paused), queue: session.queue, radio: session.radio });
+};
+
+const publishStage = () => {
+  const channelId = session.channelId;
+  if (session.dead || !channelId) return;
+  const send = (stage) => api(`/voice/${channelId}/stage`, { method: "PUT", body: stage }).catch((e) => log("palco", `falha ao publicar: ${e.message}`));
+  scheduleSend(STAGE_KEY, send, liveStage(), { delay: STAGE_DEBOUNCE_MS });
+};
+
 const refreshPlayer = (delay = 0) => {
   const np = session.nowPlaying;
-  if (!np) return;
-  scheduleEdit(np.messageId, np.channelId, livePlayerCard(np.track), { delay });
+  if (np) scheduleEdit(np.messageId, np.channelId, livePlayerCard(np.track), { delay });
+  publishStage();
 };
 
 const endPlayer = (state) => {
@@ -325,6 +343,7 @@ const startPlayback = (track, mode) => {
     log("player", `erro: ${e.message}`);
     if (session.current === thisTrack) playNext("ended");
   });
+  publishStage();
 };
 
 const playNext = (reason = "skipped") => {
@@ -335,6 +354,7 @@ const playNext = (reason = "skipped") => {
   session.current = next ?? null;
   if (!next) {
     session.player?.stop();
+    publishStage();
     if (session.radio) radioFill(true);
     return;
   }
@@ -416,6 +436,7 @@ const stopAll = () => {
   killProcs();
   unduck();
   session.player?.stop();
+  publishStage();
 };
 
 const setRadio = (on, by) => {
@@ -462,6 +483,20 @@ const resumeBy = (by) => {
 const stopBy = (by) => {
   stopAll();
   note(session.textChannelId, { tone: "muted", emoji: "⏹️", title: `Parada por ${by}`, text: "Fila limpa." });
+};
+
+const clearQueueBy = (by, channelId) => {
+  if (session.queue.length === 0) {
+    note(channelId, { tone: "muted", emoji: "🤷", title: "A fila já está vazia", text: "" });
+    return;
+  }
+  for (const track of session.queue) {
+    closeQueuedCard(track, `Tirada da fila por ${by}`, track.title);
+    dropTrackFile(track);
+  }
+  session.queue = [];
+  note(channelId, { tone: "muted", emoji: "🧹", title: `Fila limpa por ${by}`, text: "A música atual segue tocando." });
+  refreshPlayer(500);
 };
 
 const takeFromQueue = (seq, channelId) => {
@@ -636,6 +671,7 @@ const leave = async () => {
   session.dead = true;
   if (session.idleTimer) clearInterval(session.idleTimer);
   stopAll();
+  edits.delete(STAGE_KEY);
   const room = session.room;
   session.room = null;
   session.channelId = null;
@@ -732,34 +768,37 @@ const handleMessage = async (message) => {
 const handleCardAction = async ({ messageId, channelId, actionId, user }) => {
   const who = user?.name ?? "alguém";
   session.lastActivity = Date.now();
+  const fromStage = String(messageId ?? "").startsWith("stage:");
+  const replyChannel = fromStage ? session.textChannelId : channelId;
   const [verb, arg] = String(actionId ?? "").split(":");
-  log("card", `${who} clicou em ${actionId}`);
+  log("card", `${who} clicou em ${actionId}${fromStage ? " (palco)" : ""}`);
   if (verb === "enter") {
-    if (await enterVoice(user?.id, channelId)) postCard(channelId, helpCard("Campeão na área"));
+    if (await enterVoice(user?.id, replyChannel)) postCard(replyChannel, helpCard("Campeão na área"));
     return;
   }
   if (verb === "replay") {
-    const track = cardTracks.get(messageId);
-    if (!track?.url) { note(channelId, { tone: "muted", emoji: "🤷", title: "Perdi essa faixa", text: "Peça de novo com !play." }); return; }
-    if (!session.room && !(await enterVoice(user?.id, channelId))) return;
-    session.textChannelId = channelId;
+    const track = cardTracks.get(messageId) ?? (fromStage ? session.current : null);
+    if (!track?.url) { note(replyChannel, { tone: "muted", emoji: "🤷", title: "Perdi essa faixa", text: "Peça de novo com !play." }); return; }
+    if (!session.room && !(await enterVoice(user?.id, replyChannel))) return;
+    if (!fromStage) session.textChannelId = channelId;
     await enqueue(track.url, who);
     return;
   }
   if (!session.room || session.dead) {
-    note(channelId, { tone: "muted", emoji: "🎧", title: "Não estou tocando nada", text: "Me chame com !entra de dentro da sala de voz." });
+    note(replyChannel, { tone: "muted", emoji: "🎧", title: "Não estou tocando nada", text: "Me chame com !entra de dentro da sala de voz." });
     return;
   }
-  session.textChannelId = channelId;
+  if (!fromStage) session.textChannelId = channelId;
   if (verb === "pause") pauseBy(who);
   else if (verb === "resume") resumeBy(who);
   else if (verb === "skip") skipBy(who);
   else if (verb === "veto") vetoCurrent(who);
   else if (verb === "stop") stopBy(who);
   else if (verb === "radio") setRadio(!session.radio, who);
-  else if (verb === "queue") postCard(channelId, queueCard(session.current, session.queue, session.radio));
-  else if (verb === "bump") bumpBy(Number(arg), who, channelId);
-  else if (verb === "remove") removeBy(Number(arg), who, channelId);
+  else if (verb === "clear") clearQueueBy(who, replyChannel);
+  else if (verb === "queue") postCard(replyChannel, queueCard(session.current, session.queue, session.radio));
+  else if (verb === "bump") bumpBy(Number(arg), who, replyChannel);
+  else if (verb === "remove") removeBy(Number(arg), who, replyChannel);
 };
 
 const WS_CONNECT_TIMEOUT_MS = 10000;

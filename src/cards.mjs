@@ -10,6 +10,13 @@ const thumbOf = (track) => {
 
 const radioAction = (on) => ({ id: "radio", label: "Rádio", icon: "radio", ...(on ? { active: true } : {}) });
 
+const queueItemActions = (track) => [
+  { id: `bump:${track?.seq ?? 0}`, label: "Tocar agora", icon: "up" },
+  { id: `remove:${track?.seq ?? 0}`, label: "Tirar da fila", icon: "trash" },
+];
+
+const STAGE_MAX_QUEUE = 50;
+
 export const trackCard = (track) => ({
   title: track?.title ?? "",
   url: track?.url ?? null,
@@ -48,11 +55,18 @@ export const queuedCard = (track, position) => ({
   kind: "queued",
   track: trackCard(track),
   position: Math.max(1, Math.round(position || 1)),
-  actions: [
-    { id: `bump:${track?.seq ?? 0}`, label: "Tocar agora", icon: "up" },
-    { id: `remove:${track?.seq ?? 0}`, label: "Tirar da fila", icon: "trash" },
-  ],
+  actions: queueItemActions(track),
 });
+
+export const stageOf = ({ current, state = "playing", positionMs = 0, paused = false, queue = [], radio = false }) => {
+  const items = (queue ?? []).slice(0, STAGE_MAX_QUEUE);
+  return {
+    player: current ? playerCard({ track: current, state, positionMs, radio, queueLength: items.length, paused }) : null,
+    queue: items.map((track) => ({ track: trackCard(track), actions: queueItemActions(track) })),
+    radio: Boolean(radio),
+    actions: [radioAction(radio), ...(items.length ? [{ id: "clear", label: "Limpar fila", icon: "trash", style: "danger" }] : [])],
+  };
+};
 
 export const queueCard = (current, items, radio) => ({
   kind: "queue",
