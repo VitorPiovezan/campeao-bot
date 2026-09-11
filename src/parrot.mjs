@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { AudioFrame, AudioSource, AudioStream, LocalAudioTrack, Room, RoomEvent, TrackKind, TrackPublishOptions, TrackSource } from "@livekit/rtc-node";
+import { helpCard, noteCard, playerCard, queueCard, queuedCard } from "./cards.mjs";
 import {
   ATTENTION_MS, BEEP_FILE, COMMAND_MAX_SECONDS, DUCK_TIMEOUT_MS, DUCK_VOLUME, FF_FAST, FF_OUT, GROQ_KEY, HOT_USER_MS, LEAVE_VERBS,
-  MAX_UTTERANCE_SECONDS, PAUSE_VERBS, PLAY_VERBS, PRINT_FLAT, REMIX_WORDS, RESUME_VERBS, SKIP_VERBS, SOURCE_NAMES, STOP_VERBS, YTDLP_BASE,
-  cacheLookup, dropTrackFile, ensureBeep, fmtDur, gateAllowed, gateWake, infoFresh, isWakeWord, matchVerb, norm, parseCandidates, parseSource,
+  MAX_UTTERANCE_SECONDS, PAUSE_VERBS, PLAY_VERBS, PRINT_FLAT, REMIX_WORDS, RESUME_VERBS, SKIP_VERBS, STOP_VERBS, YTDLP_BASE,
+  cacheLookup, dropTrackFile, ensureBeep, gateAllowed, gateWake, infoFresh, isWakeWord, matchVerb, norm, parseCandidates, parseSource,
   prefetch, resolveTrack, runYtdlp, shortErr, sliceSeconds, to16kMono, transcribe, videoIdOf,
 } from "./core.mjs";
 
@@ -40,6 +42,17 @@ const api = async (path, init = {}) => {
   return res.json();
 };
 
+const apiForm = async (path, form) => {
+  const res = await fetch(`${PARROT_URL}${path}`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${BOT_TOKEN}` },
+    body: form,
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) throw new Error(`${path} -> ${res.status} ${(await res.text()).slice(0, 120)}`);
+  return res.json();
+};
+
 const world = { me: null, users: new Map(), channels: [], voice: [] };
 const userName = (id) => world.users.get(id)?.name ?? id;
 const isBotUser = (id) => world.users.get(id)?.isBot ?? world.users.get(id)?.email?.includes(BOT_DOMAIN_SUFFIX) ?? false;
@@ -51,14 +64,80 @@ const say = (channelId, content) => {
   api(`/channels/${channelId}/messages`, { method: "POST", body: { content: content.slice(0, 3900) } }).catch((e) => log("chat", `falha ao enviar: ${e.message}`));
 };
 
+const cardTracks = new Map();
+const rememberTrack = (messageId, track) => {
+  if (!messageId || !track) return;
+  cardTracks.set(messageId, track);
+  if (cardTracks.size > 200) cardTracks.delete(cardTracks.keys().next().value);
+};
+
+const postCard = async (channelId, card) => {
+  if (!channelId) return null;
+  try {
+    return await api(`/channels/${channelId}/messages`, { method: "POST", body: { card } });
+  } catch (e) {
+    log("chat", `falha ao enviar card: ${e.message}`);
+    return null;
+  }
+};
+
+const note = (channelId, options) => postCard(channelId, noteCard(options));
+
+const EDIT_MIN_GAP_MS = 1000;
+const edits = new Map();
+
+const flushEdit = (messageId) => {
+  const entry = edits.get(messageId);
+  if (!entry?.pending) return;
+  const card = entry.pending;
+  entry.pending = null;
+  entry.lastAt = Date.now();
+  if (entry.final) edits.delete(messageId);
+  api(`/channels/${entry.channelId}/messages/${messageId}`, { method: "PATCH", body: { card } }).catch((e) => log("chat", `falha ao editar card: ${e.message}`));
+};
+
+const scheduleEdit = (messageId, channelId, card, { delay = 0, final = false } = {}) => {
+  if (!messageId || !channelId) return;
+  const entry = edits.get(messageId) ?? { channelId, lastAt: 0, timer: null, pending: null, final: false };
+  if (entry.final) return;
+  entry.channelId = channelId;
+  entry.pending = card;
+  entry.final = final;
+  edits.set(messageId, entry);
+  if (entry.timer) clearTimeout(entry.timer);
+  const wait = Math.max(delay, entry.lastAt + EDIT_MIN_GAP_MS - Date.now());
+  if (wait <= 0) {
+    entry.timer = null;
+    flushEdit(messageId);
+    return;
+  }
+  entry.timer = setTimeout(() => {
+    entry.timer = null;
+    flushEdit(messageId);
+  }, wait);
+};
+
 class PcmPlayer {
   constructor(source) {
     this.source = source;
     this.volume = 1;
-    this.paused = false;
+    this._paused = false;
+    this.pausedAt = null;
+    this.playedMs = 0;
     this.token = 0;
     this.current = null;
     this.onEnd = null;
+  }
+
+  get paused() {
+    return this._paused;
+  }
+
+  set paused(value) {
+    const on = Boolean(value);
+    if (on === this._paused) return;
+    this._paused = on;
+    this.pausedAt = on ? Date.now() : null;
   }
 
   get playing() {
@@ -80,6 +159,7 @@ class PcmPlayer {
     const token = ++this.token;
     this.current = { stream };
     this.paused = false;
+    this.playedMs = 0;
     let leftover = Buffer.alloc(0);
     let played = 0;
     const startedAt = Date.now();
@@ -97,6 +177,7 @@ class PcmPlayer {
           for (let i = 0; i < samples.length; i++) samples[i] = gain === 1 ? slice.readInt16LE(i * 2) : Math.max(-32768, Math.min(32767, Math.round(slice.readInt16LE(i * 2) * gain)));
           await this.source.captureFrame(new AudioFrame(samples, SAMPLE_RATE, CHANNELS, FRAME_SAMPLES));
           played += FRAME_MS;
+          this.playedMs = played;
           offset += FRAME_BYTES;
         }
         leftover = Buffer.from(buf.subarray(offset));
@@ -120,6 +201,7 @@ const session = {
   player: null,
   queue: [],
   current: null,
+  nowPlaying: null,
   procs: [],
   attention: new Map(),
   hotUsers: new Map(),
@@ -170,11 +252,39 @@ const playBeep = async () => {
   }
 };
 
-const nowPlayingText = (track) => {
-  const parts = [`🎵 Tocando agora${track.radio ? " · Rádio" : ""}: ${track.title}`, track.url, `${track.radio ? "Sugestão do rádio" : `Pedido por ${track.by}`} · ${SOURCE_NAMES[track.source] ?? "—"}${fmtDur(track.duration) ? ` · ${fmtDur(track.duration)}` : ""}`];
-  return parts.join("\n");
+const positionNow = () => session.player?.playedMs ?? 0;
+
+const livePlayerCard = (track) => playerCard({ track, state: session.player?.paused ? "paused" : "playing", positionMs: positionNow(), radio: session.radio, queueLength: session.queue.length });
+
+const refreshPlayer = (delay = 0) => {
+  const np = session.nowPlaying;
+  if (!np) return;
+  scheduleEdit(np.messageId, np.channelId, livePlayerCard(np.track), { delay });
 };
-const queueText = () => [session.current ? `Agora · ${session.current.title}` : "Nada tocando.", ...session.queue.map((t, i) => `${i + 1} · ${t.title}${t.radio ? " · rádio" : ""}`)].join("\n");
+
+const endPlayer = (state) => {
+  const np = session.nowPlaying;
+  if (!np) return;
+  session.nowPlaying = null;
+  scheduleEdit(np.messageId, np.channelId, playerCard({ track: np.track, state, positionMs: positionNow(), radio: session.radio, queueLength: session.queue.length }), { final: true });
+};
+
+const closeQueuedCard = (track, title, text) => {
+  const messageId = track?.queuedMessageId;
+  if (!messageId) return;
+  track.queuedMessageId = null;
+  scheduleEdit(messageId, track.queuedChannelId ?? session.textChannelId, noteCard({ tone: "muted", emoji: "🎵", title, text }), { final: true });
+};
+
+const postPlayer = async (track) => {
+  const channelId = session.textChannelId;
+  if (!channelId) return;
+  const message = await postCard(channelId, playerCard({ track, state: "playing", positionMs: 0, radio: session.radio, queueLength: session.queue.length }));
+  if (!message?.id) return;
+  rememberTrack(message.id, track);
+  if (session.current === track) session.nowPlaying = { messageId: message.id, channelId, track };
+  else scheduleEdit(message.id, channelId, playerCard({ track, state: "skipped", positionMs: 0, radio: session.radio, queueLength: session.queue.length }), { final: true });
+};
 
 const startPlayback = (track, mode) => {
   killProcs();
@@ -209,15 +319,16 @@ const startPlayback = (track, mode) => {
         startPlayback(thisTrack, "completa");
         return;
       }
-      playNext();
+      playNext("ended");
     },
   }).catch((e) => {
     log("player", `erro: ${e.message}`);
-    if (session.current === thisTrack) playNext();
+    if (session.current === thisTrack) playNext("ended");
   });
 };
 
-const playNext = () => {
+const playNext = (reason = "skipped") => {
+  endPlayer(reason);
   killProcs();
   unduck();
   const next = session.queue.shift();
@@ -232,7 +343,8 @@ const playNext = () => {
   const cached = next.file && existsSync(next.file) ? next.file : cacheLookup(next.url);
   if (cached) next.file = cached;
   startPlayback(next, cached ? "cache" : "info");
-  say(session.textChannelId, nowPlayingText(next));
+  closeQueuedCard(next, "Já tocou", next.title);
+  postPlayer(next);
   if (session.radio && session.queue.length === 0) radioFill(false);
 };
 
@@ -256,6 +368,7 @@ const radioFill = async (playNow) => {
     const track = { title: pick.title, url: pick.url, source: "youtube", thumb: pick.thumbnail, duration: pick.duration, by: "Rádio", radio: true, seq: ++session.seqCounter };
     session.queue.push(track);
     prefetch(track, "radio");
+    refreshPlayer(500);
     if (playNow && !session.current) playNext();
   } catch (e) {
     log("radio", `falhou: ${shortErr(e)}`);
@@ -268,7 +381,7 @@ const enqueue = async (rawQuery, by) => {
   const { query, source } = parseSource(rawQuery);
   const seq = ++session.seqCounter;
   const track = await resolveTrack(query, source);
-  if (!track) { say(session.textChannelId, `Nada encontrado para “${query}”`); return; }
+  if (!track) { note(session.textChannelId, { tone: "error", emoji: "🤷", title: `Nada encontrado para “${query}”`, text: "Tente outro nome, ou diga a fonte: “…no YouTube”." }); return; }
   track.by = by;
   track.seq = seq;
   const recentTs = session.recentEnqueued.get(track.url);
@@ -281,12 +394,23 @@ const enqueue = async (rawQuery, by) => {
   if (!session.current) playNext();
   else {
     prefetch(track);
-    say(session.textChannelId, `Na fila #${session.queue.indexOf(track) + 1} · ${track.title} · pedido por ${by}`);
+    refreshPlayer(500);
+    const channelId = session.textChannelId;
+    const message = await postCard(channelId, queuedCard(track, session.queue.indexOf(track) + 1));
+    if (message?.id) {
+      track.queuedMessageId = message.id;
+      track.queuedChannelId = channelId;
+      rememberTrack(message.id, track);
+    }
   }
 };
 
 const stopAll = () => {
-  for (const t of [session.current, ...session.queue]) dropTrackFile(t);
+  endPlayer("stopped");
+  for (const t of [session.current, ...session.queue]) {
+    closeQueuedCard(t, "Saiu da fila", t?.title ?? "");
+    dropTrackFile(t);
+  }
   session.queue = [];
   session.current = null;
   killProcs();
@@ -298,12 +422,14 @@ const setRadio = (on, by) => {
   session.radio = on;
   session.lastActivity = Date.now();
   if (on) {
-    say(session.textChannelId, `Rádio ligado por ${by} — quando a fila acabar eu sigo tocando parecidas`);
+    note(session.textChannelId, { tone: "success", emoji: "📻", title: `Rádio ligado por ${by}`, text: "Quando a fila acabar eu sigo tocando parecidas." });
     if (!session.current) radioFill(true); else if (session.queue.length === 0) radioFill(false);
   } else {
+    for (const suggestion of session.queue.filter((t) => t.radio)) closeQueuedCard(suggestion, "Saiu da fila", "Rádio desligado.");
     session.queue = session.queue.filter((t) => !t.radio);
-    say(session.textChannelId, `Rádio desligado por ${by}`);
+    note(session.textChannelId, { tone: "muted", emoji: "📻", title: `Rádio desligado por ${by}`, text: "Tirei as sugestões da fila." });
   }
+  refreshPlayer();
 };
 
 const vetoCurrent = (by) => {
@@ -311,8 +437,57 @@ const vetoCurrent = (by) => {
   if (!cur) return;
   const key = norm(cur.title).split(" ").slice(0, 3).join(" ");
   if (key) session.vetoed.add(key);
-  say(session.textChannelId, `${by} vetou ${cur.title} — não repito nesta sessão`);
+  note(session.textChannelId, { tone: "muted", emoji: "👎", title: `${by} vetou ${cur.title}`, text: "Não repito nesta sessão." });
   playNext();
+};
+
+const skipBy = (by) => {
+  note(session.textChannelId, { tone: "muted", emoji: "⏭️", title: `Pulada por ${by}`, text: session.current?.title ?? "" });
+  playNext();
+};
+
+const pauseBy = (by) => {
+  if (session.player) session.player.paused = true;
+  note(session.textChannelId, { tone: "muted", emoji: "⏸️", title: `Pausada por ${by}`, text: session.current?.title ?? "" });
+  refreshPlayer();
+};
+
+const resumeBy = (by) => {
+  unduck();
+  if (session.player) session.player.paused = false;
+  note(session.textChannelId, { tone: "muted", emoji: "▶️", title: `Retomada por ${by}`, text: session.current?.title ?? "" });
+  refreshPlayer();
+};
+
+const stopBy = (by) => {
+  stopAll();
+  note(session.textChannelId, { tone: "muted", emoji: "⏹️", title: `Parada por ${by}`, text: "Fila limpa." });
+};
+
+const takeFromQueue = (seq, channelId) => {
+  const index = session.queue.findIndex((t) => t.seq === seq);
+  if (index === -1) {
+    note(channelId, { tone: "muted", emoji: "🤷", title: "Essa já saiu da fila", text: "" });
+    return null;
+  }
+  return session.queue.splice(index, 1)[0];
+};
+
+const bumpBy = (seq, by, channelId) => {
+  const track = takeFromQueue(seq, channelId);
+  if (!track) return;
+  session.queue.unshift(track);
+  if (track.queuedMessageId) scheduleEdit(track.queuedMessageId, track.queuedChannelId ?? channelId, queuedCard(track, 1));
+  note(channelId, { tone: "muted", emoji: "⏫", title: `${by} puxou pra frente`, text: track.title });
+  refreshPlayer(500);
+};
+
+const removeBy = (seq, by, channelId) => {
+  const track = takeFromQueue(seq, channelId);
+  if (!track) return;
+  dropTrackFile(track);
+  closeQueuedCard(track, `Tirada da fila por ${by}`, track.title);
+  refreshPlayer(500);
 };
 
 const handleVoice = (userId, raw, startedAt) => {
@@ -350,18 +525,20 @@ const handleVoice = (userId, raw, startedAt) => {
     const query = tail.replace(/^(a musica |o som |a |um |uma )/, "").replace(/\s+(ai|por favor|pra mim|pra gente|rapidao|agora)$/, "").trim();
     if (!query) return;
     unduck();
-    say(session.textChannelId, `${who} pediu “${query}” — buscando…`);
+    note(session.textChannelId, { tone: "info", emoji: "🔎", title: `${who} pediu “${query}”`, text: "Buscando…" });
     enqueue(query, who);
     return;
   }
-  if (matchVerb(head, SKIP_VERBS)) { unduck(); say(session.textChannelId, `Pulada por ${who}`); playNext(); return; }
-  if (matchVerb(head, PAUSE_VERBS)) { if (session.player) session.player.paused = true; say(session.textChannelId, `Pausada por ${who}`); return; }
-  if (matchVerb(head, RESUME_VERBS)) { unduck(); if (session.player) session.player.paused = false; say(session.textChannelId, `Retomada por ${who}`); return; }
-  if (matchVerb(head, STOP_VERBS) || /^cala/.test(head)) { stopAll(); say(session.textChannelId, `Parada por ${who} — fila limpa`); return; }
-  if (LEAVE_VERBS.includes(head)) { say(session.textChannelId, `Até mais! Dispensado por ${who}.`); leave(); return; }
-  if (wakeIdx !== -1) say(session.textChannelId, `Entendi “${rest}” — comando desconhecido`);
+  if (matchVerb(head, SKIP_VERBS)) { unduck(); skipBy(who); return; }
+  if (matchVerb(head, PAUSE_VERBS)) { pauseBy(who); return; }
+  if (matchVerb(head, RESUME_VERBS)) { unduck(); resumeBy(who); return; }
+  if (matchVerb(head, STOP_VERBS) || /^cala/.test(head)) { stopBy(who); return; }
+  if (LEAVE_VERBS.includes(head)) { note(session.textChannelId, { tone: "muted", emoji: "👋", title: "Até mais!", text: `Dispensado por ${who}.` }); leave(); return; }
+  if (wakeIdx !== -1) note(session.textChannelId, { tone: "muted", emoji: "🤔", title: `Entendi “${rest}”`, text: "Comando desconhecido." });
   log("wake", `não entendi: "${rest}"`);
 };
+
+const CALL_BACK_ACTION = { id: "enter", label: "Chamar de volta", icon: "enter" };
 
 const rmsOf = (frame) => {
   let sum = 0;
@@ -443,12 +620,12 @@ const checkIdle = () => {
   if (session.dead || !session.channelId) return;
   if (humansIn(session.channelId) === 0) {
     session.emptySince ??= Date.now();
-    if (Date.now() - session.emptySince > EMPTY_MS) { say(session.textChannelId, "Sala vazia, saindo"); log("idle", "sala vazia, saindo"); leave(); }
+    if (Date.now() - session.emptySince > EMPTY_MS) { note(session.textChannelId, { tone: "warn", emoji: "👋", title: "Sala vazia, saindo", text: "Me chame de volta quando quiser som.", actions: [CALL_BACK_ACTION] }); log("idle", "sala vazia, saindo"); leave(); }
     return;
   }
   session.emptySince = null;
   if (!session.current && Date.now() - session.lastActivity > IDLE_MS) {
-    say(session.textChannelId, "5 minutos sem música e sem comando, vou nessa. Chame com !entra");
+    note(session.textChannelId, { tone: "warn", emoji: "💤", title: "5 minutos sem música e sem comando", text: "Vou nessa — me chame com !entra.", actions: [CALL_BACK_ACTION] });
     log("idle", "ocioso 5min, saindo");
     leave();
   }
@@ -465,7 +642,7 @@ const leave = async () => {
   session.listening.clear();
   try { await room?.disconnect(); } catch {}
   sendVoiceState(null);
-  Object.assign(session, { dead: false, queue: [], current: null, played: new Set(), vetoed: new Set(), radio: false, attention: new Map(), hotUsers: new Map(), recentCommands: new Map(), recentEnqueued: new Map(), emptySince: null });
+  Object.assign(session, { dead: false, queue: [], current: null, nowPlaying: null, played: new Set(), vetoed: new Set(), radio: false, attention: new Map(), hotUsers: new Map(), recentCommands: new Map(), recentEnqueued: new Map(), emptySince: null });
   log("voz", "saí da sala");
 };
 
@@ -510,15 +687,21 @@ const sendVoiceState = (channelId) => {
   if (socket?.readyState === 1) socket.send(JSON.stringify({ type: "voiceState", channelId, muted: false, camera: false, screen: false }));
 };
 
-const HELP = [
-  "Como usar o Campeão",
-  'Por voz (comigo na sala): "Campeão, toca <música>" — e também: pula, pausa, continua, para, sai.',
-  'Com música tocando, diga só "Campeão": o som abaixa e eu escuto por 2s.',
-  'Fonte específica: "…no YouTube" ou "…no SoundCloud". Sem indicar, o Deezer identifica a faixa oficial.',
-  'Rádio: "Campeão, liga o rádio" — quando a fila acaba, sigo tocando parecidas. "Campeão, essa não" veta a atual.',
-  "Saio sozinho após 5 min sem música e sem comando, ou 1 min com a sala vazia.",
-  "Por texto: !entra !play !pula !pausa !continua !para !fila !radio !sai",
-].join("\n");
+const enterVoice = async (userId, textChannelId) => {
+  const voiceChannel = voiceChannelOf(userId);
+  if (!voiceChannel) {
+    note(textChannelId, { tone: "warn", emoji: "🎧", title: "Entre numa sala de voz primeiro", text: "Depois me chame com !entra." });
+    return false;
+  }
+  try {
+    await join(voiceChannel, textChannelId);
+    return true;
+  } catch (e) {
+    log("voz", `falha ao entrar: ${e.message}`);
+    note(textChannelId, { tone: "error", emoji: "⚠️", title: "Não consegui entrar na sala", text: e.message });
+    return false;
+  }
+};
 
 const handleMessage = async (message) => {
   if (message.author.id === world.me?.id || message.author.isBot || !message.content.startsWith("!")) return;
@@ -527,34 +710,56 @@ const handleMessage = async (message) => {
   const command = (cmd ?? "").toLowerCase();
   const who = message.author.name;
   if (["entra", "play", "p", "toca"].includes(command)) {
-    const voiceChannel = voiceChannelOf(message.author.id);
-    if (!voiceChannel) { say(message.channelId, "Entre numa sala de voz primeiro"); return; }
-    try {
-      await join(voiceChannel, message.channelId);
-    } catch (e) {
-      log("voz", `falha ao entrar: ${e.message}`);
-      say(message.channelId, `Não consegui entrar na sala: ${e.message}`);
-      return;
-    }
-    if (command === "entra") {
-      say(message.channelId, ['Campeão na área. Fale "Campeão, toca <música>" — ou use !play <música>.', "Por voz também: pula · pausa · continua · para · sai", '"…no YouTube" ou "…no SoundCloud" força a fonte. !ajuda para o resto.'].join("\n"));
-      return;
-    }
-    if (!query) { say(message.channelId, "Informe a música: !play wonderwall oasis"); return; }
+    if (!(await enterVoice(message.author.id, message.channelId))) return;
+    if (command === "entra") { postCard(message.channelId, helpCard("Campeão na área")); return; }
+    if (!query) { note(message.channelId, { tone: "warn", emoji: "🎧", title: "Informe a música", text: "Exemplo: !play wonderwall oasis" }); return; }
     await enqueue(query, who);
     return;
   }
-  if (!session.room) { if (command === "ajuda") say(message.channelId, HELP); return; }
+  if (!session.room) { if (command === "ajuda") postCard(message.channelId, helpCard()); return; }
   session.textChannelId = message.channelId;
   session.lastActivity = Date.now();
   if (command === "radio") setRadio(!session.radio, who);
   else if (["pula", "skip", "proxima"].includes(command)) playNext();
   else if (["para", "stop"].includes(command)) stopAll();
-  else if (command === "pausa") { if (session.player) session.player.paused = true; }
-  else if (["continua", "resume"].includes(command)) { if (session.player) session.player.paused = false; }
-  else if (command === "fila") say(message.channelId, queueText());
+  else if (command === "pausa") { if (session.player) session.player.paused = true; refreshPlayer(); }
+  else if (["continua", "resume"].includes(command)) { if (session.player) session.player.paused = false; refreshPlayer(); }
+  else if (command === "fila") postCard(message.channelId, queueCard(session.current, session.queue, session.radio));
   else if (["sai", "sair"].includes(command)) leave();
-  else if (command === "ajuda") say(message.channelId, HELP);
+  else if (command === "ajuda") postCard(message.channelId, helpCard());
+};
+
+const handleCardAction = async ({ messageId, channelId, actionId, user }) => {
+  const who = user?.name ?? "alguém";
+  session.lastActivity = Date.now();
+  const [verb, arg] = String(actionId ?? "").split(":");
+  log("card", `${who} clicou em ${actionId}`);
+  if (verb === "enter") {
+    if (await enterVoice(user?.id, channelId)) postCard(channelId, helpCard("Campeão na área"));
+    return;
+  }
+  if (verb === "replay") {
+    const track = cardTracks.get(messageId);
+    if (!track?.url) { note(channelId, { tone: "muted", emoji: "🤷", title: "Perdi essa faixa", text: "Peça de novo com !play." }); return; }
+    if (!session.room && !(await enterVoice(user?.id, channelId))) return;
+    session.textChannelId = channelId;
+    await enqueue(track.url, who);
+    return;
+  }
+  if (!session.room || session.dead) {
+    note(channelId, { tone: "muted", emoji: "🎧", title: "Não estou tocando nada", text: "Me chame com !entra de dentro da sala de voz." });
+    return;
+  }
+  session.textChannelId = channelId;
+  if (verb === "pause") pauseBy(who);
+  else if (verb === "resume") resumeBy(who);
+  else if (verb === "skip") skipBy(who);
+  else if (verb === "veto") vetoCurrent(who);
+  else if (verb === "stop") stopBy(who);
+  else if (verb === "radio") setRadio(!session.radio, who);
+  else if (verb === "queue") postCard(channelId, queueCard(session.current, session.queue, session.radio));
+  else if (verb === "bump") bumpBy(Number(arg), who, channelId);
+  else if (verb === "remove") removeBy(Number(arg), who, channelId);
 };
 
 const connectSocket = () => {
@@ -576,6 +781,7 @@ const connectSocket = () => {
     else if (data.type === "channelDeleted") world.channels = world.channels.filter((c) => c.id !== data.channelId);
     else if (data.type === "voice") { world.voice = data.participants; if (session.channelId) checkIdle(); }
     else if (data.type === "message") handleMessage(data.message).catch((e) => log("chat", `erro: ${e.message}`));
+    else if (data.type === "cardAction") handleCardAction(data).catch((e) => log("card", `erro: ${e.message}`));
   });
   socket.addEventListener("close", (event) => {
     log("ws", `fechou (${event.code}), reconectando em 3s`);
@@ -584,6 +790,59 @@ const connectSocket = () => {
   socket.addEventListener("error", () => {});
 };
 
+const AVATAR_HASH_FILE = `${existsSync("/data") ? "/data" : tmpdir()}/parrot-avatar.hash`;
+
+const discordProfile = async () => {
+  const token = process.env.DISCORD_TOKEN;
+  if (!token) return null;
+  try {
+    const res = await fetch("https://discord.com/api/v10/users/@me", { headers: { authorization: `Bot ${token}` }, signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 80)}`);
+    return await res.json();
+  } catch (e) {
+    log("perfil", `não li o perfil do Discord: ${e.message}`);
+    return null;
+  }
+};
+
+const syncAvatar = async (me, profile) => {
+  if (!profile?.avatar) return;
+  try {
+    const stored = existsSync(AVATAR_HASH_FILE) ? readFileSync(AVATAR_HASH_FILE, "utf8").trim() : null;
+    if (me.avatarUrl && stored === profile.avatar) return;
+    const ext = profile.avatar.startsWith("a_") ? "gif" : "png";
+    const res = await fetch(`https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.${ext}?size=512`, { signal: AbortSignal.timeout(20000) });
+    if (!res.ok) throw new Error(`cdn -> ${res.status}`);
+    const form = new FormData();
+    form.append("file", new Blob([await res.arrayBuffer()], { type: ext === "gif" ? "image/gif" : "image/png" }), `avatar.${ext}`);
+    await apiForm("/me/avatar", form);
+    writeFileSync(AVATAR_HASH_FILE, profile.avatar);
+    log("perfil", "avatar do Discord enviado");
+  } catch (e) {
+    log("perfil", `falha no avatar: ${e.message}`);
+  }
+};
+
+const syncIdentity = async (me) => {
+  const profile = await discordProfile();
+  const name = process.env.PARROT_BOT_NAME ?? profile?.global_name ?? profile?.username ?? "Campeão";
+  try {
+    if (name && name !== me.name) {
+      await api("/me", { method: "PATCH", body: { name } });
+      log("perfil", `nome ajustado para ${name}`);
+    }
+  } catch (e) {
+    log("perfil", `falha ao ajustar o nome: ${e.message}`);
+  }
+  await syncAvatar(me, profile);
+};
+
 try { ensureBeep(); } catch (e) { log("beep", `falhou (seguindo sem): ${e.message}`); }
-api("/me").then((me) => { log("boot", `autenticado como ${me.name} em ${PARROT_URL}`); connectSocket(); }).catch((e) => { console.error(`[parrot] não autenticou em ${PARROT_URL}: ${e.message}`); process.exit(1); });
+api("/me")
+  .then(async (me) => {
+    log("boot", `autenticado como ${me.name} em ${PARROT_URL}`);
+    await syncIdentity(me).catch((e) => log("perfil", `falhou: ${e.message}`));
+    connectSocket();
+  })
+  .catch((e) => { console.error(`[parrot] não autenticou em ${PARROT_URL}: ${e.message}`); process.exit(1); });
 process.on("SIGTERM", () => leave().finally(() => process.exit(0)));
