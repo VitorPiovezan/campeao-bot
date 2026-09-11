@@ -762,33 +762,83 @@ const handleCardAction = async ({ messageId, channelId, actionId, user }) => {
   else if (verb === "remove") removeBy(Number(arg), who, channelId);
 };
 
+const WS_CONNECT_TIMEOUT_MS = 10000;
+const WS_RETRY_MIN_MS = 3000;
+const WS_RETRY_MAX_MS = 30000;
+const WS_WATCHDOG_MS = 15000;
+let reconnectTimer = null;
+let retryMs = WS_RETRY_MIN_MS;
+let connectingSince = 0;
+
+const scheduleReconnect = (why) => {
+  if (reconnectTimer) return;
+  log("ws", `${why}, reconectando em ${Math.round(retryMs / 1000)}s`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectSocket();
+  }, retryMs);
+  retryMs = Math.min(WS_RETRY_MAX_MS, retryMs * 2);
+};
+
+const handleSocketEvent = (data) => {
+  if (data.type === "ready") {
+    world.me = data.me;
+    world.users = new Map(data.users.map((u) => [u.id, u]));
+    world.channels = data.channels;
+    world.voice = data.voice;
+    log("ws", `pronto como ${data.me.name}; ${data.channels.length} canais, ${data.users.size ?? data.users.length} usuários`);
+    if (session.channelId) sendVoiceState(session.channelId);
+  } else if (data.type === "user") world.users.set(data.user.id, data.user);
+  else if (data.type === "channel") world.channels = [...world.channels.filter((c) => c.id !== data.channel.id), data.channel];
+  else if (data.type === "channelDeleted") world.channels = world.channels.filter((c) => c.id !== data.channelId);
+  else if (data.type === "voice") { world.voice = data.participants; if (session.channelId) checkIdle(); }
+  else if (data.type === "message") handleMessage(data.message).catch((e) => log("chat", `erro: ${e.message}`));
+  else if (data.type === "cardAction") handleCardAction(data).catch((e) => log("card", `erro: ${e.message}`));
+};
+
 const connectSocket = () => {
   const wsUrl = PARROT_URL.replace(/^http/, "ws") + `/ws?token=${encodeURIComponent(BOT_TOKEN)}`;
-  socket = new WebSocket(wsUrl);
-  socket.addEventListener("open", () => log("ws", "conectado"));
-  socket.addEventListener("message", (event) => {
+  const ws = new WebSocket(wsUrl);
+  socket = ws;
+  connectingSince = Date.now();
+  const connectTimer = setTimeout(() => {
+    if (socket !== ws || ws.readyState !== WebSocket.CONNECTING) return;
+    log("ws", `conexão travou por ${WS_CONNECT_TIMEOUT_MS / 1000}s, desistindo dela`);
+    try { ws.close(); } catch {}
+    if (socket === ws) {
+      socket = null;
+      scheduleReconnect("conexão abandonada");
+    }
+  }, WS_CONNECT_TIMEOUT_MS);
+  ws.addEventListener("open", () => {
+    clearTimeout(connectTimer);
+    retryMs = WS_RETRY_MIN_MS;
+    log("ws", "conectado");
+  });
+  ws.addEventListener("message", (event) => {
     let data;
     try { data = JSON.parse(event.data); } catch { return; }
-    if (data.type === "ready") {
-      world.me = data.me;
-      world.users = new Map(data.users.map((u) => [u.id, u]));
-      world.channels = data.channels;
-      world.voice = data.voice;
-      log("ws", `pronto como ${data.me.name}; ${data.channels.length} canais, ${data.users.size ?? data.users.length} usuários`);
-      if (session.channelId) sendVoiceState(session.channelId);
-    } else if (data.type === "user") world.users.set(data.user.id, data.user);
-    else if (data.type === "channel") world.channels = [...world.channels.filter((c) => c.id !== data.channel.id), data.channel];
-    else if (data.type === "channelDeleted") world.channels = world.channels.filter((c) => c.id !== data.channelId);
-    else if (data.type === "voice") { world.voice = data.participants; if (session.channelId) checkIdle(); }
-    else if (data.type === "message") handleMessage(data.message).catch((e) => log("chat", `erro: ${e.message}`));
-    else if (data.type === "cardAction") handleCardAction(data).catch((e) => log("card", `erro: ${e.message}`));
+    handleSocketEvent(data);
   });
-  socket.addEventListener("close", (event) => {
-    log("ws", `fechou (${event.code}), reconectando em 3s`);
-    setTimeout(connectSocket, 3000);
+  ws.addEventListener("close", (event) => {
+    clearTimeout(connectTimer);
+    if (socket !== ws) return;
+    socket = null;
+    scheduleReconnect(`fechou (${event.code})`);
   });
-  socket.addEventListener("error", () => {});
+  ws.addEventListener("error", () => {});
 };
+
+setInterval(() => {
+  if (reconnectTimer) return;
+  if (!socket) { scheduleReconnect("sem conexão"); return; }
+  if (socket.readyState === WebSocket.CONNECTING && Date.now() - connectingSince > WS_CONNECT_TIMEOUT_MS + WS_WATCHDOG_MS) {
+    const stuck = socket;
+    socket = null;
+    try { stuck.close(); } catch {}
+    scheduleReconnect("conexão presa");
+  }
+}, WS_WATCHDOG_MS).unref();
 
 const AVATAR_HASH_FILE = `${existsSync("/data") ? "/data" : tmpdir()}/parrot-avatar.hash`;
 
