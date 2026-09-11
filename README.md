@@ -212,10 +212,18 @@ Uso: numa sala de voz, mande `!entra` num canal de texto. Daí `"Campeão, toca 
 
 No Parrot o bot fala por **cards** (`src/cards.mjs`): player com posição, estado e botões (pausar, pular, não curti, parar, rádio, fila), card de fila, de faixa enfileirada (tocar agora · tirar da fila), avisos e ajuda. Clique em botão volta pelo WebSocket como `cardAction` e roda a mesma rotina do comando de texto, com o nome de quem clicou.
 
+### Palco da sala
+
+Além dos cards no chat, o bot publica um **palco** no tile dele dentro da sala de voz: `PUT /voice/<sala>/stage` com o player (capa, posição, estado e os mesmos botões), a fila inteira — cada faixa com *tocar agora* e *tirar da fila* — e os botões da sala (rádio · limpar fila). Quem está na call vê e controla o som sem sair pro chat.
+
+O palco é republicado a cada virada (faixa nova, pausa, retomada, rádio, fila mexida) pelo mesmo agendador dos cards: no máximo uma publicação por segundo, com 500 ms de espera pra juntar rajadas. Quando não há faixa nem fila, o bot publica `null`; ao sair da sala ou cair, o servidor limpa sozinho.
+
+Clique no palco chega pelo WebSocket como `cardAction` com `messageId` `stage:<sala>` e roda a mesma rotina do botão do card — com `limpar fila`, que esvazia a fila sem parar a faixa atual. Os avisos dessas ações continuam indo pro canal de texto onde o bot foi chamado.
+
 Pra conferir os cards no app sem yt-dlp nem LiveKit:
 
 ```bash
 PARROT_URL=... PARROT_BOT_TOKEN=... node scripts/parrot-cards-demo.mjs
 ```
 
-Ele posta um de cada tipo no canal `geral` (ou `PARROT_DEMO_CHANNEL`), anima o player (tocando → pausada → rádio → terminou) e responde a cada clique. Ctrl+C encerra.
+Ele posta um de cada tipo no canal `geral` (ou `PARROT_DEMO_CHANNEL`), anima o player (tocando → pausada → rádio → terminou) e responde a cada clique. Depois entra na sala de voz `Sala 1` (ou `PARROT_DEMO_VOICE`), se ela existir, e publica um palco de mentira: player tocando com fila de cinco, virando a cada 5 s (tocando → pausada → rádio → troca de faixa → fila vazia). Os cliques no palco são aplicados de mentira ali mesmo — pausar pausa, pular puxa a próxima, tirar da fila remove — e republicados, pra dar pra clicar no app. Ctrl+C encerra.
