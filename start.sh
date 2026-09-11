@@ -6,4 +6,7 @@ if [ -n "$COOKIES_B64" ]; then
 fi
 chrt --idle 0 nice -n 19 python3 /app/stt/server.py &
 chrt --idle 0 nice -n 19 node /opt/bgutil/server/build/main.js &
+if [ -n "$PARROT_BOT_TOKEN" ]; then
+  node /app/src/parrot.mjs &
+fi
 exec node /app/src/index.mjs

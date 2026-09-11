@@ -192,3 +192,17 @@ reconhecido), `[busca]` (candidatos e pontuação), `[player]` (via de reproduç
 - **Comando não reconhecido**: o canal mostra o que ele entendeu. Se um comando legítimo
   estiver sendo barrado, ajuste `gateHasWake` (porteiro) ou as listas de verbos em
   `src/index.mjs`.
+
+
+## Parrot
+
+O mesmo bot toca também no [Parrot](https://parrot.arvore.dev), o chat interno da Árvore. É um processo separado (`src/parrot.mjs`) que sobe junto no `start.sh` quando `PARROT_BOT_TOKEN` está definido, e usa o mesmo núcleo do Discord (`src/core.mjs`: busca no YouTube/Deezer/SoundCloud, cache, STT e o parser dos comandos). Se o lado Parrot cair, o Discord segue.
+
+| Variável | O que é |
+| --- | --- |
+| `PARROT_URL` | Servidor do Parrot (padrão `https://parrot.arvore.dev`) |
+| `PARROT_BOT_TOKEN` | Token do bot `campeao` em `PARROT_BOT_TOKENS` do servidor |
+| `STT_URL` | Whisper local (padrão `http://127.0.0.1:5005/`) |
+| `CACHE_DIR` | Cache de faixas (padrão `/data/tracks`) |
+
+Uso: numa sala de voz, mande `!entra` num canal de texto. Daí `"Campeão, toca <música>"` por voz ou `!play <música>` por texto, igual ao Discord. O áudio entra na sala como uma faixa própria do bot; o bot ignora as faixas de soundboard e outros bots ao escutar.
