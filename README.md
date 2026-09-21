@@ -31,13 +31,15 @@ Sempre começando com **"Campeão"** — a palavra-chave tolera erros de transcr
 
 ### Por texto
 
-`!entra` · `!play <música>` · `!pula` · `!pausa` · `!continua` · `!para` · `!fila` ·
-`!radio` · `!sai` · `!ajuda`
+`!entra` · `!play <música>` · `!pula` · `!pausa` · `!continua` · `!volta10` · `!avanca10` ·
+`!para` · `!fila` · `!radio` · `!sai` · `!ajuda`
 
 ### Por botão
 
-O card "Tocando agora" traz controles clicáveis: **Pausar/Retomar**, **Pular**,
-**Não curti**, **Parar**, **Ligar rádio** e **Ver fila** (resposta privada).
+O card "Tocando agora" traz controles clicáveis: **Pausar/Retomar**, **Voltar 10s**,
+**Avançar 10s**, **Pular**, **Não curti**, **Parar**, **Ligar rádio** e **Ver fila**
+(resposta privada). A barra de progresso também é arrastável: soltar em qualquer ponto
+manda a faixa pra lá, pra todo mundo na sala.
 Os botões refletem o estado atual e somem do card antigo quando entra música nova.
 
 ---
@@ -210,7 +212,7 @@ No boot o adapter copia nome e avatar do bot do Discord (`DISCORD_TOKEN`) pro pe
 
 Uso: numa sala de voz, mande `!entra` num canal de texto. Daí `"Campeão, toca <música>"` por voz ou `!play <música>` por texto, igual ao Discord. O áudio entra na sala como uma faixa própria do bot; o bot ignora as faixas de soundboard e outros bots ao escutar.
 
-No Parrot o bot fala por **cards** (`src/cards.mjs`): player com posição, estado e botões (pausar, pular, não curti, parar, rádio, fila), card de fila, de faixa enfileirada (tocar agora · tirar da fila), avisos e ajuda. Clique em botão volta pelo WebSocket como `cardAction` e roda a mesma rotina do comando de texto, com o nome de quem clicou.
+No Parrot o bot fala por **cards** (`src/cards.mjs`): player com posição, estado e botões (pausar, 10s pra trás e pra frente, pular, não curti, parar, rádio, fila), card de fila, de faixa enfileirada (tocar agora · tirar da fila), avisos e ajuda. Clique em botão volta pelo WebSocket como `cardAction` e roda a mesma rotina do comando de texto, com o nome de quem clicou.
 
 ### Palco da sala
 
@@ -218,7 +220,7 @@ Além dos cards no chat, o bot publica um **palco** no tile dele dentro da sala 
 
 O palco é republicado a cada virada (faixa nova, pausa, retomada, rádio, fila mexida) pelo mesmo agendador dos cards: no máximo uma publicação por segundo, com 500 ms de espera pra juntar rajadas. Quando não há faixa nem fila, o bot publica `null`; ao sair da sala ou cair, o servidor limpa sozinho.
 
-Clique no palco chega pelo WebSocket como `cardAction` com `messageId` `stage:<sala>` e roda a mesma rotina do botão do card — com `limpar fila`, que esvazia a fila sem parar a faixa atual. Os avisos dessas ações continuam indo pro canal de texto onde o bot foi chamado.
+Clique no palco chega pelo WebSocket como `cardAction` com `messageId` `stage:<sala>` e roda a mesma rotina do botão do card — com `limpar fila`, que esvazia a fila sem parar a faixa atual. Arrastar a barra chega como `seek:<ms>`, e os botões de 10s como `back10`/`forward10`: o bot reinicia o ffmpeg a partir do ponto pedido (do arquivo em cache quando já tem, senão do próprio stream) e republica o palco, então todo mundo na sala anda junto. Os avisos dessas ações continuam indo pro canal de texto onde o bot foi chamado.
 
 Pra conferir os cards no app sem yt-dlp nem LiveKit:
 

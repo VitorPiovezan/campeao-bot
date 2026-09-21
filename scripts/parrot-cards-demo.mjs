@@ -118,8 +118,13 @@ const pushStage = async () => {
 const applyStageAction = (actionId) => {
   const [verb, arg] = String(actionId ?? "").split(":");
   const seq = Number(arg);
+  const durationMs = stage.current?.duration ? Math.round(stage.current.duration * 1000) : 0;
+  const seekTo = (ms) => { stage.positionMs = Math.max(0, Math.min(durationMs - 2000, Math.round(ms))); };
   if (verb === "pause") stage.paused = true;
   else if (verb === "resume") stage.paused = false;
+  else if (verb === "back10") seekTo(stage.positionMs - 10000);
+  else if (verb === "forward10") seekTo(stage.positionMs + 10000);
+  else if (verb === "seek") seekTo(Number(arg));
   else if (verb === "skip" || verb === "veto") { stage.current = stage.queue.shift() ?? null; stage.positionMs = 0; stage.paused = false; }
   else if (verb === "replay") { stage.positionMs = 0; stage.paused = false; }
   else if (verb === "stop") { stage.current = null; stage.queue = []; }

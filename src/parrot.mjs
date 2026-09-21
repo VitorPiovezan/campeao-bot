@@ -160,14 +160,15 @@ class PcmPlayer {
     }
   }
 
-  async play(stream, { onEnd } = {}) {
+  async play(stream, { onEnd, offsetMs = 0, paused = false } = {}) {
     this.stop();
     const token = ++this.token;
     this.current = { stream };
-    this.paused = false;
-    this.playedMs = 0;
+    this._paused = paused;
+    this.pausedAt = paused ? Date.now() : null;
+    this.playedMs = offsetMs;
     let leftover = Buffer.alloc(0);
-    let played = 0;
+    let played = offsetMs;
     const startedAt = Date.now();
     try {
       for await (const chunk of stream) {
@@ -193,7 +194,7 @@ class PcmPlayer {
     } finally {
       if (token === this.token) {
         this.current = null;
-        onEnd?.({ playedMs: played, elapsedMs: Date.now() - startedAt });
+        onEnd?.({ playedMs: played, freshMs: played - offsetMs, elapsedMs: Date.now() - startedAt });
       }
     }
   }
@@ -304,19 +305,21 @@ const postPlayer = async (track) => {
   else scheduleEdit(message.id, channelId, playerCard({ track, state: "skipped", positionMs: 0, radio: session.radio, queueLength: session.queue.length }), { final: true });
 };
 
-const startPlayback = (track, mode) => {
+const startPlayback = (track, mode, { offsetMs = 0, paused = false } = {}) => {
   killProcs();
+  const from = offsetMs > 0 ? ["-ss", (offsetMs / 1000).toFixed(3)] : [];
+  const at = offsetMs > 0 ? ` a partir de ${Math.round(offsetMs / 1000)}s` : "";
   let ff;
   if (mode === "cache") {
-    log("player", `tocando (cache): ${track.title}`);
-    ff = spawn("ffmpeg", ["-loglevel", "quiet", ...FF_FAST, "-i", track.file, ...FF_OUT]);
+    log("player", `tocando (cache)${at}: ${track.title}`);
+    ff = spawn("ffmpeg", ["-loglevel", "quiet", ...FF_FAST, ...from, "-i", track.file, ...FF_OUT]);
     session.procs = [ff];
   } else {
     const reusing = mode === "info" && infoFresh(track);
-    log("player", `tocando (${reusing ? "info reaproveitado" : "extração completa"}): ${track.title}`);
+    log("player", `tocando (${reusing ? "info reaproveitado" : "extração completa"})${at}: ${track.title}`);
     const args = reusing ? ["--load-info-json", track.infoFile] : ["--no-playlist", track.url];
     const ytdlp = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "-q", "-o", "-", ...args]);
-    ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", ...FF_OUT]);
+    ff = spawn("ffmpeg", ["-loglevel", "quiet", ...from, "-i", "pipe:0", ...FF_OUT]);
     ytdlp.stderr.on("data", (d) => log("yt-dlp", d.toString().trim().slice(0, 200)));
     ytdlp.stdout.pipe(ff.stdin);
     ff.stdin.on("error", () => {});
@@ -327,14 +330,16 @@ const startPlayback = (track, mode) => {
   ff.on("error", (e) => log("ffmpeg", `erro: ${e.message}`));
   const thisTrack = track;
   session.player.play(ff.stdout, {
-    onEnd: ({ playedMs }) => {
+    offsetMs,
+    paused,
+    onEnd: ({ freshMs }) => {
       if (session.current !== thisTrack) return;
-      if (playedMs < 1500 && !thisTrack.retried) {
+      if (freshMs < 1500 && !thisTrack.retried) {
         thisTrack.retried = true;
         thisTrack.file = null;
         thisTrack.infoFile = null;
         log("player", `áudio não iniciou, refazendo pela via longa: ${thisTrack.title}`);
-        startPlayback(thisTrack, "completa");
+        startPlayback(thisTrack, "completa", { offsetMs, paused });
         return;
       }
       playNext("ended");
@@ -478,6 +483,31 @@ const resumeBy = (by) => {
   if (session.player) session.player.paused = false;
   note(session.textChannelId, { tone: "muted", emoji: "▶️", title: `Retomada por ${by}`, text: session.current?.title ?? "" });
   refreshPlayer();
+};
+
+const SEEK_STEP_MS = 10000;
+const SEEK_TAIL_MS = 2000;
+
+const seekTo = (positionMs, by) => {
+  const track = session.current;
+  if (!track || !session.player) return;
+  const durationMs = track.duration ? Math.round(track.duration * 1000) : null;
+  if (!durationMs) {
+    note(session.textChannelId, { tone: "muted", emoji: "⏱️", title: "Essa faixa não tem tempo pra correr", text: track.title });
+    return;
+  }
+  const target = Math.max(0, Math.min(durationMs - SEEK_TAIL_MS, Math.round(positionMs)));
+  const cached = track.file && existsSync(track.file) ? track.file : cacheLookup(track.url);
+  if (cached) track.file = cached;
+  const paused = Boolean(session.player.paused);
+  log("player", `${by} moveu pra ${Math.round(target / 1000)}s: ${track.title}`);
+  startPlayback(track, cached ? "cache" : "info", { offsetMs: target, paused });
+  refreshPlayer();
+};
+
+const seekByStep = (stepMs, by) => {
+  if (!session.current || !session.player) return;
+  seekTo(positionNow() + stepMs, by);
 };
 
 const stopBy = (by) => {
@@ -760,6 +790,8 @@ const handleMessage = async (message) => {
   else if (["para", "stop"].includes(command)) stopAll();
   else if (command === "pausa") { if (session.player) session.player.paused = true; refreshPlayer(); }
   else if (["continua", "resume"].includes(command)) { if (session.player) session.player.paused = false; refreshPlayer(); }
+  else if (["volta10", "voltar10"].includes(command)) seekByStep(-SEEK_STEP_MS, who);
+  else if (["avanca10", "avancar10"].includes(command)) seekByStep(SEEK_STEP_MS, who);
   else if (command === "fila") postCard(message.channelId, queueCard(session.current, session.queue, session.radio));
   else if (["sai", "sair"].includes(command)) leave();
   else if (command === "ajuda") postCard(message.channelId, helpCard());
@@ -791,6 +823,9 @@ const handleCardAction = async ({ messageId, channelId, actionId, user }) => {
   if (!fromStage) session.textChannelId = channelId;
   if (verb === "pause") pauseBy(who);
   else if (verb === "resume") resumeBy(who);
+  else if (verb === "back10") seekByStep(-SEEK_STEP_MS, who);
+  else if (verb === "forward10") seekByStep(SEEK_STEP_MS, who);
+  else if (verb === "seek") seekTo(Number(arg), who);
   else if (verb === "skip") skipBy(who);
   else if (verb === "veto") vetoCurrent(who);
   else if (verb === "stop") stopBy(who);
