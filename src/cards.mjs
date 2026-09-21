@@ -29,16 +29,24 @@ export const trackCard = (track) => ({
 
 export const playerCard = ({ track, state = "playing", positionMs = 0, radio = false, queueLength = 0, paused = false }) => {
   const resolved = paused && state === "playing" ? "paused" : state;
-  const actions = TERMINAL_STATES.has(resolved)
-    ? [{ id: "replay", label: "Tocar de novo", icon: "replay" }, ...(radio ? [radioAction(true)] : [])]
-    : [
+  const live = !TERMINAL_STATES.has(resolved);
+  const seekable = live && Boolean(track?.duration);
+  const actions = live
+    ? [
         resolved === "paused" ? { id: "resume", label: "Retomar", icon: "play" } : { id: "pause", label: "Pausar", icon: "pause" },
+        ...(seekable
+          ? [
+              { id: "back10", label: "Voltar 10s", icon: "back10" },
+              { id: "forward10", label: "Avançar 10s", icon: "forward10" },
+            ]
+          : []),
         { id: "skip", label: "Pular", icon: "skip" },
         { id: "veto", label: "Não curti", icon: "thumbsDown" },
         { id: "stop", label: "Parar", icon: "stop", style: "danger" },
         radioAction(radio),
         { id: "queue", label: "Fila", icon: "queue" },
-      ];
+      ]
+    : [{ id: "replay", label: "Tocar de novo", icon: "replay" }, ...(radio ? [radioAction(true)] : [])];
   return {
     kind: "player",
     track: trackCard(track),
@@ -47,6 +55,7 @@ export const playerCard = ({ track, state = "playing", positionMs = 0, radio = f
     at: new Date().toISOString(),
     radio: Boolean(radio),
     queueLength: Math.max(0, Math.round(queueLength || 0)),
+    seekable,
     actions,
   };
 };
@@ -97,7 +106,7 @@ export const helpCard = (title = "Como usar o Campeão") => ({
         'Fonte específica: "…no YouTube" ou "…no SoundCloud". Sem indicar, o Deezer identifica a faixa oficial.',
       ],
     },
-    { title: "Por texto", lines: ["!entra !play !pula !pausa !continua !para !fila !radio !ajuda !sai"] },
+    { title: "Por texto", lines: ["!entra !play !pula !pausa !continua !volta10 !avanca10 !para !fila !radio !ajuda !sai"] },
     {
       title: "Rádio",
       lines: ['"Campeão, liga o rádio" — quando a fila acaba, sigo tocando parecidas.', '"Campeão, essa não" veta a atual e eu não repito nesta sessão.'],
